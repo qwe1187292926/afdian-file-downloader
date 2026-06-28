@@ -1,0 +1,35 @@
+# Local configuration and secrets
+config.json
+cookies.txt
+*.cookies
+*.cookie
+.env
+
+# Local agent notes
+AGENTS.md
+
+# Download outputs and runtime state
+downloads/
+Video/
+download_state.json
+manifest.jsonl
+*.part
+
+# Browser profiles
+browser-profile/
+browser-profile-ifdian/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

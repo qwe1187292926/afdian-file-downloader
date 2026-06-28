@@ -1,0 +1,5 @@
+# Put one Afdian page URL per line.
+# Examples:
+# https://ifdian.net/a/<creator>
+# https://ifdian.net/p/<post-id>
+
