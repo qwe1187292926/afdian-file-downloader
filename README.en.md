@@ -50,6 +50,7 @@ This tool does not bypass paywalls, CAPTCHA, permission checks, or DRM. It only 
 - Filesystem fallback when the state file is missing.
 - Average download speed printed after each file.
 - Bark notifications with downloaded titles in the message body.
+- One-time Bark alerts for new creator posts that your current tier cannot access, with state tracking to avoid repeated alerts.
 
 ## Quick Start
 
@@ -215,7 +216,7 @@ python download_post.py
 
 ## Deduplication
 
-`download_state.json` stores downloaded file state. It is created at startup and saved immediately after every successful download or local-file skip.
+`download_state.json` stores downloaded file state and inaccessible-post alert state. It is created at startup and saved immediately after every successful download, local-file skip, or newly detected inaccessible post.
 
 The primary key is based on:
 
@@ -230,6 +231,8 @@ If the state file is missing, the script checks existing files in the target pos
 2nd file -> title-1.mp4
 3rd file -> title-2.mp4
 ```
+
+If a creator post cannot be viewed because the current account does not have the required paid tier, the script records it under `inaccessible_posts`. Later runs do not repeat the alert while the post is still inaccessible. If you upgrade your tier and the post becomes accessible, the script clears that inaccessible state and proceeds through the normal download flow.
 
 ## Bark Notifications
 
@@ -250,11 +253,13 @@ Enable Bark in `config.json`:
 
 When new files are downloaded, the notification body includes the downloaded video or attachment titles.
 
+When a creator has a new post that cannot be downloaded with the current account permissions, the script also sends a one-time alert. The alert body includes the post title and tries to extract the required paid tier or plan from API fields. If Ifdian does not return that information, the body says that the API did not return a specific paid tier.
+
 ## Runtime Files
 
 | File | Description |
 | --- | --- |
-| `download_state.json` | Deduplication state. |
+| `download_state.json` | Deduplication state, plus inaccessible-post alert state. |
 | `manifest.jsonl` | Detailed records for successful, skipped, and failed items. |
 | `*.part` | Temporary file during download. |
 
