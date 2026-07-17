@@ -13,10 +13,13 @@
   "since": "",
   "until": "",
   "stop_post_id": "",
+  "incremental_scan": true,
+  "incremental_lookback_posts": 20,
+  "incremental_full_scan_days": 30,
   "creators": [
     {
       "url": "https://ifdian.net/a/520Labula_?tab=feed",
-      "since": "2026-06-26",
+      "since": "",
       "until": "",
       "max_posts": 0,
       "stop_post_id": ""

@@ -45,9 +45,11 @@
 - 支持按创作者主页批量下载投稿。
 - 支持按单帖 URL 下载。
 - 支持 `since` / `until` 日期边界。
-- 使用帖子标题命名文件和目录。
-- 使用 `download_state.json` 去重，重复运行不会反复下载。
-- 状态文件缺失时也会检查目标目录中的既有文件，尽量避免重复生成 `-1` 文件。
+- 默认对创作者投稿做增量扫描，并定期执行全量补扫。
+- 使用稳定的创作者 ID / 帖子 ID 目录，标题或发布时间变化不会改变保存路径。
+- 使用帖子标题或附件名称生成可读文件名，并通过 `.afdian-post.json` 记录帖子和文件映射。
+- 使用 `download_state.json` v2 稳定资源标识去重，并兼容迁移旧版状态。
+- 状态文件缺失时也会通过帖子 sidecar 和预期文件名检查既有文件，尽量避免重复生成 `-1` 文件。
 - 下载完成后输出平均速度。
 - 支持 Bark 通知，并在通知正文中包含本次下载标题。
 - 创作者有新投稿但当前账号无权限查看时，会发送一次无法下载提醒，并记录状态避免重复提醒。
@@ -127,6 +129,9 @@ cookie_a=value_a; cookie_b=value_b; cookie_c=value_c
   "since": "",
   "until": "",
   "stop_post_id": "",
+  "incremental_scan": true,
+  "incremental_lookback_posts": 20,
+  "incremental_full_scan_days": 30,
   "creators": [
     {
       "url": "https://ifdian.net/a/creator?tab=feed",
@@ -159,11 +164,20 @@ cookie_a=value_a; cookie_b=value_b; cookie_c=value_c
 | `include_images` | 是否下载图片资源。默认 `false`，避免头像、封面等噪音。 |
 | `overwrite` | 是否覆盖已存在文件。默认 `false`。 |
 | `skip_existing` | 是否跳过已下载文件。默认 `true`。 |
-| `dry_run` | 预览模式，只检查可下载项，不写文件。 |
+| `dry_run` | 预览模式，不下载内容，也不推进增量检查点或清除无权限状态。运行时状态文件和 manifest 仍可能被创建或记录。 |
+| `timeout` | 单个下载请求的超时秒数，默认 `60`。 |
+| `per_page` | 创作者投稿接口每页请求数量，默认 `10`。 |
+| `max_posts` | 单次最多处理的投稿数；`0` 表示不限。非零值属于手动扫描边界，会停用自动增量检查点。 |
 | `since` / `until` | 全局日期边界，支持 `YYYY-MM-DD` 或 `YYYYMMDD`。 |
+| `stop_post_id` | 扫描遇到此帖子 ID 时停止；空字符串表示不设置。非空值会停用自动增量检查点。 |
+| `incremental_scan` | 是否启用创作者投稿自动增量扫描，必须是 JSON 布尔值，默认 `true`。 |
+| `incremental_lookback_posts` | 增量扫描遇到已知检查点后，继续回看的非置顶投稿数，默认 `20`，负数按 `0` 处理。 |
+| `incremental_full_scan_days` | 距离上次全量扫描多少天后再做一次全量补扫，默认 `30`；设为 `0` 可关闭周期全量补扫，但首次运行仍会全量扫描。 |
 | `creators` | 创作者主页列表，用于批量下载。 |
 | `single_posts` | 单帖 URL 列表，用于查漏补缺。 |
 | `bark` | Bark 推送配置。 |
+
+`creators` 中的字段会覆盖同名全局字段，因此可以为不同创作者分别设置日期边界或扫描策略。
 
 ## 下载创作者投稿
 
@@ -188,19 +202,40 @@ python download_creators.py
 [config] download_dir=...
 [config] state_file=...
 [config] manifest=...
-[config] options={...}
+[config] options={..., "incremental_scan": true, "incremental_lookback_posts": 20, "incremental_full_scan_days": 30}
+[incremental] mode=full|incremental, lookback_posts=20, full_scan_days=30
 ```
 
 输出目录示例：
 
 ```text
 downloads/
-  创作者名称/
-    2026-06-27-帖子标题/
+  creator-<ID 安全标识>/
+    post-<ID 安全标识>/
+      .afdian-post.json
       帖子标题.mp4
   download_state.json
   manifest.jsonl
 ```
+
+目录标识只由稳定 ID 派生，格式为清洗后的短前缀加 12 位 SHA-256 摘要；创作者改名、帖子改标题或发布时间变化时仍会复用同一路径。每个新帖子目录中的 `.afdian-post.json` 保存完整 ID、当前标题、链接、发布时间和资源到相对文件名的映射。
+
+## 增量扫描
+
+`incremental_scan` 默认为 `true`。没有可用检查点时（通常是第一次运行），脚本会扫描该创作者的全部可见投稿并保存最近的非置顶帖子 ID；后续运行从最新一页开始，在遇到任一已知检查点后，再回看 `incremental_lookback_posts` 条非置顶投稿，然后停止。置顶投稿会正常处理，但不会建立检查点，也不会消耗回看数量。
+
+默认每 `incremental_full_scan_days=30` 天执行一次全量补扫。将该值设为 `0` 只会关闭周期补扫；首次扫描仍是全量。切换 `include_images` 或检测到旧版资源标识检查点时，也会自动做一次全量扫描。
+
+以下任一情况会停用自动增量检查点，并按当前配置执行普通扫描：
+
+- 设置了 `since`、`until`、非零 `max_posts` 或 `stop_post_id`；
+- `skip_existing=false`；
+- `overwrite=true`；
+- `incremental_scan=false`。
+
+保存在 `inaccessible_posts` 中的无权限帖子会在增量窗口之外单独重试，因此旧帖子在账号权限恢复后仍能被发现。只有确认帖子无可下载文件，或所有候选均已下载/已存在后，才会清除该记录；失败、跳过或预览运行都会保留它。
+
+检查点只会在扫描安全结束、manifest 写入成功且本次 feed 投稿没有详情失败、下载失败或跳过后推进。`dry_run` 可以读取现有检查点来缩小扫描范围，但不会推进检查点。
 
 ## 下载单个帖子
 
@@ -218,21 +253,27 @@ python .\download_post.py
 
 ## 去重机制
 
-`download_state.json` 用于记录已下载文件和已提醒过的无权限投稿。脚本启动时会创建该文件，并在每个文件下载成功、被识别为本地已存在，或发现无权限投稿后立即保存。
+`download_state.json` 用于记录已下载文件、创作者增量扫描检查点和已提醒过的无权限投稿。脚本启动时会创建该文件，并在每个文件下载成功、被识别为本地已存在，或发现无权限投稿后立即保存。
 
-正常去重使用：
+当前 v2 资源键会进行 SHA-256 哈希，其原始标识由以下稳定信息组成：
 
 ```text
-post_id + 下载 URL + 文件名提示
+post_id + （可用时的资源定位符） + 规范化下载 URL
 ```
 
-如果状态文件丢失，脚本会用目标目录中的文件兜底判断。对于同一个帖子里的多个同名文件，会按候选顺序对应：
+帖子标题和可变的文件名提示不参与资源标识。URL 规范化会移除 fragment，并且只在识别到一组完整签名参数时移除对应的 AWS、Google Cloud、腾讯 COS、阿里 OSS 或 CloudFront 签名字段；无法确认用途的独立 `sign`、`token` 等查询参数会保留，避免把实际不同的资源错误合并。
+
+旧版 v1/v0 状态会在再次命中时惰性迁移：只有旧键或 URL 匹配唯一、当前规范化 URL 没有遗留的功能性或未知 query、记录指向的文件仍存在，并且该物理路径尚未被其他 v2 资源占用时，才会为它建立 v2 别名。同一旧文件不会分配给两个新资源。无法安全证明等价的旧 query 记录会重新下载一次。旧的标题目录不会被自动重命名；只要旧状态仍指向其中的文件，迁移后仍能继续识别。
+
+如果状态文件丢失，脚本会先使用 ID 帖子目录中的 `.afdian-post.json` 查找精确的相对文件名，再用预期文件名兜底。对于同一个帖子里的多个同名文件，会按候选顺序对应：
 
 ```text
 第 1 个文件 -> 标题.mp4
 第 2 个文件 -> 标题-1.mp4
 第 3 个文件 -> 标题-2.mp4
 ```
+
+sidecar 会校验创作者 ID 和帖子 ID，并且只接受帖子目录内的单层相对文件名。为避免误占用户文件，一个非空的 ID 帖子目录如果没有 `.afdian-post.json`，脚本会拒绝直接接管并记录失败。
 
 如果某篇创作者投稿因为当前账号付费等级不足而无法查看，脚本会把它记录到状态文件的 `inaccessible_posts` 中。后续检查仍然无权限时不会重复发送提醒；如果之后提升了付费等级并能访问该投稿，脚本会清除这条无权限状态并正常进入下载流程。
 
@@ -261,8 +302,9 @@ post_id + 下载 URL + 文件名提示
 
 | 文件 | 说明 |
 | --- | --- |
-| `download_state.json` | 去重状态文件，也保存已提醒过的无权限投稿。 |
+| `download_state.json` | v2 去重状态、创作者增量检查点及已提醒过的无权限投稿。 |
 | `manifest.jsonl` | 每个成功、跳过、失败记录的明细日志。 |
+| `creator-<ID 安全标识>/post-<ID 安全标识>/.afdian-post.json` | 帖子元数据及 v2 资源键到本地相对文件名的映射，用于安全的文件系统兜底。 |
 | `*.part` | 下载中的临时文件，正常完成后会被替换成最终文件。 |
 
 ## 可选浏览器模式
@@ -276,11 +318,21 @@ pip install -r requirements-browser.txt
 python -m playwright install chromium
 ```
 
+## 开发校验
+
+修改代码后可运行内置回归测试和语法校验：
+
+```powershell
+python -m unittest discover -s tests -v
+python -m py_compile .\afdian_downloader.py .\afdian_config_common.py .\download_creators.py .\download_post.py
+```
+
 ## 注意事项
 
 - 不要提交 `config.json`、`cookies.txt`、`download_state.json`、`manifest.jsonl` 或下载文件。
 - Cookie 失效后需要重新复制。
-- 不设置 `since`、`until`、`max_posts` 或 `stop_post_id` 时，会尝试遍历账号可见的全部投稿。
+- 默认增量模式在首次运行时遍历全部可见投稿，之后从最新投稿扫描到检查点并回看；关闭增量后才会在无手动边界时每次遍历全部可见投稿。
+- 设置任一手动边界会停用自动增量检查点，避免有限范围的扫描错误推进全局检查点。
 - 平台接口变化时，可能需要更新脚本。
 
 ## 作者

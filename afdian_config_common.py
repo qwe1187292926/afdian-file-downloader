@@ -4,30 +4,39 @@ import hashlib
 import json
 import os
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlencode, urlparse, urlunparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 import requests
 
 from afdian_downloader import (
     Candidate,
+    FeedPost,
     add_cookie_text,
+    candidate_identity,
     candidates_from_post_detail,
+    canonical_candidate_url,
+    creator_directory_name,
     create_base_session,
     download_candidate,
     fetch_post_detail_api,
     format_publish_date,
     get_creator_profile,
-    iter_feed_posts_api,
     normalize_ifdian_url,
     parse_date_boundary,
+    post_directory_name,
     post_id_from_url,
     post_title_from_api,
+    scan_feed_posts_api,
     sanitize_filename,
-    slug_from_text,
 )
+
+POST_SIDECAR_NAME = ".afdian-post.json"
+POST_SIDECAR_SCHEMA_VERSION = 1
+ASSET_IDENTITY_VERSION = 2
 
 
 def configure_stdio() -> None:
@@ -94,18 +103,21 @@ def now_iso() -> str:
 
 
 def canonical_download_url(url: str) -> str:
+    return canonical_candidate_url(url)
+
+
+def legacy_canonical_download_url(url: str) -> str:
     parsed = urlparse(url)
     return urlunparse(parsed._replace(query="", fragment=""))
 
 
 def download_key(post_id: str, candidate: Candidate) -> str:
-    source = "|".join(
-        [
-            post_id,
-            canonical_download_url(candidate.url),
-            candidate.filename_hint,
-        ]
-    )
+    source = "\0".join(["v2", post_id, candidate_identity(candidate)])
+    return "v2:" + hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def download_key_v1(post_id: str, candidate: Candidate) -> str:
+    source = "|".join([post_id, legacy_canonical_download_url(candidate.url), candidate.filename_hint])
     return hashlib.sha1(source.encode("utf-8")).hexdigest()
 
 
@@ -114,17 +126,30 @@ def legacy_download_key(post_id: str, candidate: Candidate) -> str:
         [
             post_id,
             candidate.source,
-            canonical_download_url(candidate.url),
+            legacy_canonical_download_url(candidate.url),
             candidate.filename_hint,
         ]
     )
     return hashlib.sha1(source.encode("utf-8")).hexdigest()
 
 
+def file_claim_key(path: str | Path) -> str:
+    try:
+        resolved = Path(path).resolve()
+    except (OSError, RuntimeError):
+        resolved = Path(os.path.abspath(str(path)))
+    return os.path.normcase(str(resolved))
+
+
 class DownloadState:
     def __init__(self, path: Path):
         self.path = path
-        self.data: dict[str, Any] = {"downloads": {}}
+        self.data: dict[str, Any] = {
+            "schema_version": 2,
+            "downloads": {},
+            "inaccessible_posts": {},
+            "creator_scans": {},
+        }
         if path.exists():
             try:
                 loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -133,8 +158,10 @@ class DownloadState:
             except json.JSONDecodeError:
                 backup = path.with_suffix(path.suffix + ".broken")
                 path.replace(backup)
-        self.data.setdefault("downloads", {})
-        self.data.setdefault("inaccessible_posts", {})
+        self.data["schema_version"] = 2
+        for section in ("downloads", "inaccessible_posts", "creator_scans"):
+            if not isinstance(self.data.get(section), dict):
+                self.data[section] = {}
 
     def has(self, key: str) -> bool:
         entry = self.data.get("downloads", {}).get(key)
@@ -152,10 +179,23 @@ class DownloadState:
             return entry
         return None
 
-    def alias(self, new_key: str, existing_entry: dict[str, Any], post_meta: dict[str, Any]) -> None:
+    def alias(
+        self,
+        new_key: str,
+        existing_entry: dict[str, Any],
+        post_meta: dict[str, Any],
+        candidate: Candidate,
+        migrated_from: str,
+    ) -> None:
         entry = dict(existing_entry)
         entry.setdefault("post_id", post_meta.get("post_id"))
         entry.setdefault("post_title", post_meta.get("post_title"))
+        entry["identity_version"] = ASSET_IDENTITY_VERSION
+        entry["asset_key"] = new_key
+        entry["identity_url"] = canonical_download_url(candidate.url)
+        entry["asset_locator"] = candidate.asset_locator
+        entry["migrated_from"] = migrated_from
+        entry["migrated_at"] = now_iso()
         entry["aliased_at"] = now_iso()
         self.data.setdefault("downloads", {})[new_key] = entry
 
@@ -166,8 +206,32 @@ class DownloadState:
             "post_id": record.get("post_id"),
             "post_title": record.get("post_title"),
             "url": canonical_download_url(str(record.get("url") or "")),
+            "identity_version": ASSET_IDENTITY_VERSION,
+            "asset_key": key,
+            "asset_locator": record.get("asset_locator"),
             "downloaded_at": now_iso(),
         }
+
+    def find_legacy_entry_for_url(
+        self,
+        post_id: str,
+        candidate: Candidate,
+        claimed_paths: set[str],
+    ) -> tuple[str, dict[str, Any]] | None:
+        target_url = legacy_canonical_download_url(candidate.url)
+        matches: list[tuple[str, dict[str, Any]]] = []
+        for existing_key, entry in self.data.get("downloads", {}).items():
+            if not isinstance(entry, dict) or entry.get("identity_version") == ASSET_IDENTITY_VERSION:
+                continue
+            if str(entry.get("post_id") or "") != post_id:
+                continue
+            if legacy_canonical_download_url(str(entry.get("url") or "")) != target_url:
+                continue
+            path = str(entry.get("path") or "")
+            if not path or file_claim_key(path) in claimed_paths or not Path(path).exists():
+                continue
+            matches.append((str(existing_key), entry))
+        return matches[0] if len(matches) == 1 else None
 
     def get_inaccessible_post(self, post_id: str) -> dict[str, Any] | None:
         entry = self.data.get("inaccessible_posts", {}).get(post_id)
@@ -215,11 +279,82 @@ class DownloadState:
             self.data.setdefault("inaccessible_posts", {}).pop(post_id, None)
         return entry
 
+    def inaccessible_posts_for_creator(self, creator_id: str) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for entry in self.data.get("inaccessible_posts", {}).values():
+            if isinstance(entry, dict) and str(entry.get("creator_id") or "") == creator_id:
+                entries.append(dict(entry))
+        return entries
+
+    def list_inaccessible_posts(self, creator_id: str) -> list[dict[str, Any]]:
+        return self.inaccessible_posts_for_creator(creator_id)
+
+    def get_creator_scan(self, creator_id: str) -> dict[str, Any] | None:
+        entry = self.data.get("creator_scans", {}).get(creator_id)
+        if not isinstance(entry, dict) or entry.get("version") != 1:
+            return None
+        checkpoint_ids = entry.get("checkpoint_post_ids")
+        if not isinstance(checkpoint_ids, list) or not any(str(item).strip() for item in checkpoint_ids):
+            return None
+        return entry
+
+    def mark_creator_scan(
+        self,
+        creator_id: str,
+        checkpoint_post_ids: list[str],
+        checkpoint_publish_time: int,
+        full_scan: bool,
+        include_images: bool,
+    ) -> None:
+        if not checkpoint_post_ids:
+            return
+        existing = self.get_creator_scan(creator_id) or {}
+        entry = dict(existing)
+        entry.update(
+            {
+                "version": 1,
+                "checkpoint_post_id": checkpoint_post_ids[0],
+                "checkpoint_post_ids": checkpoint_post_ids,
+                "checkpoint_publish_time": checkpoint_publish_time,
+                "include_images": include_images,
+                "asset_identity_version": ASSET_IDENTITY_VERSION,
+                "updated_at": now_iso(),
+            }
+        )
+        if full_scan or not entry.get("last_full_scan_at"):
+            entry["last_full_scan_at"] = now_iso()
+        self.data.setdefault("creator_scans", {})[creator_id] = entry
+
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
+
+
+def creator_scan_requires_full_scan(
+    checkpoint: dict[str, Any] | None,
+    full_scan_days: int,
+    include_images: bool,
+) -> bool:
+    if checkpoint is None:
+        return True
+    if (
+        checkpoint.get("asset_identity_version") != ASSET_IDENTITY_VERSION
+        or checkpoint.get("include_images") != include_images
+    ):
+        return True
+    if full_scan_days <= 0:
+        return False
+    raw_timestamp = str(checkpoint.get("last_full_scan_at") or "")
+    try:
+        last_full_scan = datetime.fromisoformat(raw_timestamp)
+    except ValueError:
+        return True
+    if last_full_scan.tzinfo is None:
+        last_full_scan = last_full_scan.astimezone()
+    age = datetime.now().astimezone() - last_full_scan
+    return age.total_seconds() >= full_scan_days * 24 * 60 * 60
 
 
 def bark_notify(config: dict[str, Any], title: str, body: str, icon: str = "", url: str = "") -> bool:
@@ -438,10 +573,157 @@ def append_manifest(manifest_path: Path, records: list[dict[str, Any]]) -> None:
             manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def post_sidecar_path(output_dir: Path) -> Path:
+    return output_dir / POST_SIDECAR_NAME
+
+
+def new_post_sidecar(post_meta: dict[str, Any]) -> dict[str, Any]:
+    timestamp = now_iso()
+    return {
+        "schema_version": POST_SIDECAR_SCHEMA_VERSION,
+        "creator": {
+            "id": str(post_meta.get("creator_id") or ""),
+            "name": str(post_meta.get("creator_name") or ""),
+        },
+        "post": {
+            "id": str(post_meta.get("post_id") or ""),
+            "title": str(post_meta.get("post_title") or ""),
+            "url": str(post_meta.get("post_url") or ""),
+            "publish_time": int(post_meta.get("publish_time") or 0),
+        },
+        "assets": {},
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+
+
+def validate_post_sidecar(sidecar: dict[str, Any], post_meta: dict[str, Any], path: Path) -> None:
+    creator = sidecar.get("creator")
+    post = sidecar.get("post")
+    expected_post_id = str(post_meta.get("post_id") or "")
+    expected_creator_id = str(post_meta.get("creator_id") or "")
+    if sidecar.get("schema_version") != POST_SIDECAR_SCHEMA_VERSION:
+        raise RuntimeError(f"Unsupported post sidecar schema: {path}")
+    if not isinstance(creator, dict) or not isinstance(post, dict):
+        raise RuntimeError(f"Post sidecar creator/post metadata must be objects: {path}")
+    if str(post.get("id") or "") != expected_post_id:
+        raise RuntimeError(f"Post sidecar ID mismatch: {path}")
+    actual_creator_id = str(creator.get("id") or "")
+    if expected_creator_id and actual_creator_id != expected_creator_id:
+        raise RuntimeError(f"Post sidecar creator ID mismatch: {path}")
+    if not isinstance(sidecar.get("assets"), dict):
+        raise RuntimeError(f"Post sidecar assets must be an object: {path}")
+
+
+def save_post_sidecar(output_dir: Path, sidecar: dict[str, Any]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = post_sidecar_path(output_dir)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    sidecar["updated_at"] = now_iso()
+    tmp.write_text(json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def claim_post_directory(
+    output_dir: Path,
+    post_meta: dict[str, Any],
+    dry_run: bool,
+) -> dict[str, Any] | None:
+    path = post_sidecar_path(output_dir)
+    if path.exists():
+        try:
+            sidecar = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Could not read post sidecar {path}: {exc}") from exc
+        if not isinstance(sidecar, dict):
+            raise RuntimeError(f"Post sidecar must be a JSON object: {path}")
+        validate_post_sidecar(sidecar, post_meta, path)
+        sidecar["creator"]["name"] = str(post_meta.get("creator_name") or "")
+        sidecar["post"].update(
+            {
+                "title": str(post_meta.get("post_title") or ""),
+                "url": str(post_meta.get("post_url") or ""),
+                "publish_time": int(post_meta.get("publish_time") or 0),
+            }
+        )
+        if not dry_run:
+            save_post_sidecar(output_dir, sidecar)
+        return sidecar
+
+    if dry_run:
+        return None
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise RuntimeError(
+            f"Refusing to claim non-empty post directory without {POST_SIDECAR_NAME}: {output_dir}"
+        )
+    sidecar = new_post_sidecar(post_meta)
+    save_post_sidecar(output_dir, sidecar)
+    return sidecar
+
+
+def safe_sidecar_asset_path(output_dir: Path, sidecar: dict[str, Any], asset_key: str) -> Path | None:
+    entry = sidecar.get("assets", {}).get(asset_key)
+    if not isinstance(entry, dict):
+        return None
+    relative_name = str(entry.get("file") or "")
+    relative_path = Path(relative_name)
+    if not relative_name or relative_path.is_absolute() or len(relative_path.parts) != 1:
+        return None
+    target = (output_dir / relative_path).resolve()
+    if target.parent != output_dir.resolve() or not target.is_file():
+        return None
+    return target
+
+
+def sidecar_path_is_claimed_by_other_asset(
+    output_dir: Path,
+    sidecar: dict[str, Any],
+    asset_key: str,
+    target: Path,
+) -> bool:
+    target_key = file_claim_key(target)
+    for other_key in sidecar.get("assets", {}):
+        if other_key == asset_key:
+            continue
+        other_path = safe_sidecar_asset_path(output_dir, sidecar, str(other_key))
+        if other_path and file_claim_key(other_path) == target_key:
+            return True
+    return False
+
+
+def record_sidecar_asset(
+    output_dir: Path,
+    sidecar: dict[str, Any] | None,
+    asset_key: str,
+    candidate: Candidate,
+    record: dict[str, Any],
+) -> None:
+    if sidecar is None:
+        return
+    path_value = str(record.get("path") or "")
+    if not path_value:
+        return
+    file_path = Path(path_value).resolve()
+    if file_path.parent != output_dir.resolve() or not file_path.is_file():
+        return
+    sidecar.setdefault("assets", {})[asset_key] = {
+        "identity_url": canonical_download_url(candidate.url),
+        "asset_locator": candidate.asset_locator,
+        "source": candidate.source,
+        "filename_hint": candidate.filename_hint,
+        "file": file_path.name,
+        "bytes": record.get("bytes"),
+        "recorded_at": now_iso(),
+    }
+    save_post_sidecar(output_dir, sidecar)
+
+
 def candidate_filename_parts(candidate: Candidate) -> tuple[str, str]:
     stem = sanitize_filename(candidate.filename_hint, fallback="download")
     suffix = Path(unquote(urlparse(candidate.url).path)).suffix
     if suffix and len(suffix) <= 16:
+        if stem.lower().endswith(suffix.lower()):
+            stem = stem[: -len(suffix)]
         return stem, suffix
     return stem, ""
 
@@ -460,16 +742,31 @@ def expected_filename_for_candidate(candidate: Candidate, duplicate_index: int) 
     return f"{stem}-{duplicate_index}{suffix}"
 
 
-def existing_candidate_file(output_dir: Path, candidate: Candidate, duplicate_index: int) -> Path | None:
-    if not output_dir.exists():
+def existing_candidate_file(
+    output_dir: Path,
+    candidate: Candidate,
+    duplicate_index: int,
+    asset_key: str,
+    sidecar: dict[str, Any] | None,
+) -> Path | None:
+    if not output_dir.exists() or sidecar is None:
         return None
+
+    recorded = safe_sidecar_asset_path(output_dir, sidecar, asset_key)
+    if recorded:
+        return recorded
 
     expected_name = expected_filename_for_candidate(candidate, duplicate_index)
     if not expected_name:
         return None
 
     exact = output_dir / expected_name
-    if exact.is_file():
+    if exact.is_file() and not sidecar_path_is_claimed_by_other_asset(
+        output_dir,
+        sidecar,
+        asset_key,
+        exact,
+    ):
         return exact
     return None
 
@@ -495,11 +792,53 @@ def print_run_options(
         "overwrite",
         "dry_run",
         "include_images",
+        "incremental_scan",
+        "incremental_lookback_posts",
+        "incremental_full_scan_days",
     )
     options = {name: config.get(name) for name in option_names if config.get(name) not in (None, "")}
     if extra:
         options.update(extra)
     print(f"[{label}] options={json.dumps(options, ensure_ascii=False)}")
+
+
+def compatible_state_entry(
+    state: DownloadState,
+    post_id: str,
+    candidate: Candidate,
+    key: str,
+    v1_counts: Counter[str],
+    v0_counts: Counter[str],
+    legacy_url_counts: Counter[str],
+    claimed_paths: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    exact = state.get_existing_entry(key)
+    if exact:
+        path = str(exact.get("path") or "")
+        if path and file_claim_key(path) not in claimed_paths:
+            return key, exact
+
+    if urlparse(canonical_download_url(candidate.url)).query:
+        return None
+
+    v1_key = download_key_v1(post_id, candidate)
+    if v1_counts[v1_key] == 1:
+        entry = state.get_existing_entry(v1_key)
+        path = str(entry.get("path") or "") if entry else ""
+        if entry and path and file_claim_key(path) not in claimed_paths:
+            return v1_key, entry
+
+    v0_key = legacy_download_key(post_id, candidate)
+    if v0_counts[v0_key] == 1:
+        entry = state.get_existing_entry(v0_key)
+        path = str(entry.get("path") or "") if entry else ""
+        if entry and path and file_claim_key(path) not in claimed_paths:
+            return v0_key, entry
+
+    legacy_url = legacy_canonical_download_url(candidate.url)
+    if legacy_url_counts[legacy_url] == 1:
+        return state.find_legacy_entry_for_url(post_id, candidate, claimed_paths)
+    return None
 
 
 def download_candidates_for_post(
@@ -517,23 +856,42 @@ def download_candidates_for_post(
     dry_run = bool(config.get("dry_run", False))
     timeout = float(config.get("timeout", 60))
     duplicate_counts: dict[tuple[str, str], int] = {}
+    post_id = str(post_meta.get("post_id") or "")
+    v1_counts = Counter(download_key_v1(post_id, candidate) for candidate in candidates)
+    v0_counts = Counter(legacy_download_key(post_id, candidate) for candidate in candidates)
+    legacy_url_counts = Counter(legacy_canonical_download_url(candidate.url) for candidate in candidates)
+    claimed_paths: set[str] = set()
+    sidecar: dict[str, Any] | None = None
+    sidecar_claimed = False
 
     for candidate in candidates:
         signature = candidate_name_signature(candidate)
         duplicate_index = duplicate_counts.get(signature, 0)
         duplicate_counts[signature] = duplicate_index + 1
 
-        key = download_key(str(post_meta.get("post_id") or ""), candidate)
-        legacy_key = legacy_download_key(str(post_meta.get("post_id") or ""), candidate)
-        existing_entry = state.get_existing_entry(key) or state.get_existing_entry(legacy_key)
+        key = download_key(post_id, candidate)
+        compatible = compatible_state_entry(
+            state,
+            post_id,
+            candidate,
+            key,
+            v1_counts,
+            v0_counts,
+            legacy_url_counts,
+            claimed_paths,
+        )
+        matched_key, existing_entry = compatible if compatible else ("", None)
         if skip_existing and not overwrite and existing_entry:
-            if not state.get_existing_entry(key):
-                state.alias(key, existing_entry, post_meta)
+            existing_path = str(existing_entry.get("path") or "")
+            claimed_paths.add(file_claim_key(existing_path))
+            if matched_key != key:
+                state.alias(key, existing_entry, post_meta, candidate, matched_key)
                 state.save()
             record = {
                 "status": "already-downloaded",
                 "key": key,
                 "url": candidate.url,
+                "asset_locator": candidate.asset_locator,
                 "path": existing_entry.get("path"),
                 **post_meta,
             }
@@ -541,18 +899,35 @@ def download_candidates_for_post(
             records.append(record)
             continue
 
-        existing_path = None if overwrite or not skip_existing else existing_candidate_file(output_dir, candidate, duplicate_index)
+        if not sidecar_claimed:
+            try:
+                sidecar = claim_post_directory(output_dir, post_meta, dry_run=dry_run)
+            except Exception as exc:
+                records.append({"status": "failed", "key": key, **post_meta, "error": str(exc)})
+                return records
+            sidecar_claimed = True
+
+        existing_path = (
+            None
+            if overwrite or not skip_existing
+            else existing_candidate_file(output_dir, candidate, duplicate_index, key, sidecar)
+        )
+        if existing_path and file_claim_key(existing_path) in claimed_paths:
+            existing_path = None
         if existing_path:
+            claimed_paths.add(file_claim_key(existing_path))
             record = {
                 "status": "already-downloaded",
                 "key": key,
                 "url": candidate.url,
                 "source": candidate.source,
                 "filename_hint": candidate.filename_hint,
+                "asset_locator": candidate.asset_locator,
                 "path": str(existing_path),
                 "bytes": existing_path.stat().st_size,
                 **post_meta,
             }
+            record_sidecar_asset(output_dir, sidecar, key, candidate, record)
             state.mark(key, record)
             state.save()
             print(f"[skip-file] {existing_path}")
@@ -569,9 +944,13 @@ def download_candidates_for_post(
             dry_run=dry_run,
             timeout=timeout,
         )
-        record.update({"key": key, **post_meta})
+        record.update({"key": key, "asset_locator": candidate.asset_locator, **post_meta})
         records.append(record)
         if record.get("status") == "downloaded":
+            downloaded_path = str(record.get("path") or "")
+            if downloaded_path:
+                claimed_paths.add(file_claim_key(downloaded_path))
+            record_sidecar_asset(output_dir, sidecar, key, candidate, record)
             state.mark(key, record)
             state.save()
     return records
@@ -583,16 +962,34 @@ def creator_effective_config(global_config: dict[str, Any], creator_config: dict
     return merged
 
 
-def post_output_dir(download_dir: Path, creator_name: str, publish_time: int, title: str, post_id: str) -> Path:
-    dirname = slug_from_text(f"{format_publish_date(publish_time)} {title}", fallback=post_id[:12] or "post")
-    return download_dir / sanitize_filename(creator_name, fallback="creator") / dirname
+def post_output_dir(
+    download_dir: Path,
+    creator_name: str,
+    publish_time: int,
+    title: str,
+    post_id: str,
+    *,
+    creator_id: str = "",
+) -> Path:
+    return (
+        download_dir
+        / creator_directory_name(creator_name, creator_id)
+        / post_directory_name(publish_time, title, post_id)
+    )
 
 
 def run_creator(config: dict[str, Any], config_dir: Path, creator_config: dict[str, Any]) -> list[dict[str, Any]]:
     effective = creator_effective_config(config, creator_config)
+    effective.setdefault("incremental_scan", True)
+    effective.setdefault("incremental_lookback_posts", 20)
+    effective.setdefault("incremental_full_scan_days", 30)
     url = str(creator_config.get("url") or "").strip()
     if not url:
         return [{"status": "config-error", "error": "creator url is empty"}]
+
+    incremental_value = effective.get("incremental_scan", True)
+    if not isinstance(incremental_value, bool):
+        return [{"status": "config-error", "error": "incremental_scan must be a JSON boolean"}]
 
     session = create_session_from_config(effective, config_dir)
     download_dir = resolve_config_path(config_dir, str(effective.get("download_dir") or ""), "downloads")
@@ -614,21 +1011,76 @@ def run_creator(config: dict[str, Any], config_dir: Path, creator_config: dict[s
     creator_avatar = str(creator.get("avatar") or "")
     since_ts = parse_date_boundary(str(effective.get("since") or "") or None, end_of_day=False)
     until_ts = parse_date_boundary(str(effective.get("until") or "") or None, end_of_day=True)
-    posts = iter_feed_posts_api(
+    max_posts = int(effective.get("max_posts") or 0)
+    stop_post_id = str(effective.get("stop_post_id") or "")
+    per_page = int(effective.get("per_page") or 10)
+    lookback_posts = max(0, int(effective.get("incremental_lookback_posts", 20)))
+    full_scan_days = max(0, int(effective.get("incremental_full_scan_days", 30)))
+    include_images = bool(effective.get("include_images", False))
+    dry_run = bool(effective.get("dry_run", False))
+    has_manual_boundary = bool(
+        since_ts is not None or until_ts is not None or max_posts > 0 or stop_post_id
+    )
+    incremental_enabled = bool(
+        incremental_value
+        and not has_manual_boundary
+        and bool(effective.get("skip_existing", True))
+        and not bool(effective.get("overwrite", False))
+    )
+    checkpoint = state.get_creator_scan(creator_id) if incremental_enabled else None
+    full_scan_due = creator_scan_requires_full_scan(checkpoint, full_scan_days, include_images)
+    known_post_ids = (
+        {str(item) for item in checkpoint.get("checkpoint_post_ids", []) if str(item).strip()}
+        if checkpoint and not full_scan_due
+        else set()
+    )
+    if incremental_value and not incremental_enabled:
+        print("[incremental] disabled by manual boundaries, overwrite, or skip_existing=false")
+    elif incremental_enabled:
+        mode = "full" if not known_post_ids else "incremental"
+        print(f"[incremental] mode={mode}, lookback_posts={lookback_posts}, full_scan_days={full_scan_days}")
+
+    scan = scan_feed_posts_api(
         session=session,
         creator_user_id=creator_id,
-        max_posts=int(effective.get("max_posts") or 0),
+        max_posts=max_posts,
         since_ts=since_ts,
         until_ts=until_ts,
-        stop_post_id=str(effective.get("stop_post_id") or ""),
-        per_page=int(effective.get("per_page") or 10),
+        stop_post_id=stop_post_id,
+        per_page=per_page,
+        known_post_ids=known_post_ids,
+        incremental_lookback=lookback_posts if known_post_ids else 0,
     )
+    posts = list(scan.posts)
+    feed_post_ids = {post.post_id for post in posts}
+    retry_post_ids: set[str] = set()
+    if incremental_enabled:
+        for entry in state.inaccessible_posts_for_creator(creator_id):
+            post_id = str(entry.get("post_id") or "")
+            if not post_id or post_id in feed_post_ids:
+                continue
+            retry_post_ids.add(post_id)
+            posts.append(
+                FeedPost(
+                    post_id=post_id,
+                    title=str(entry.get("post_title") or post_id),
+                    publish_time=int(entry.get("publish_time") or 0),
+                    publish_sn="",
+                    url=str(entry.get("post_url") or f"https://www.ifdian.net/p/{post_id}"),
+                    raw={**entry, "incremental_retry": True},
+                )
+            )
 
-    print(f"[creator] {creator_name} ({creator_id}): {len(posts)} post(s)")
+    print(
+        f"[creator] {creator_name} ({creator_id}): {len(feed_post_ids)} feed post(s), "
+        f"{len(retry_post_ids)} inaccessible retry post(s); stop={scan.stop_reason or 'unknown'}"
+    )
     records: list[dict[str, Any]] = []
     inaccessible_to_notify: list[dict[str, Any]] = []
     downloaded = 0
+    checkpoint_processing_failed = False
     for post in posts:
+        is_feed_post = post.post_id in feed_post_ids
         post_meta = {
             "creator_id": creator_id,
             "creator_name": creator_name,
@@ -638,10 +1090,13 @@ def run_creator(config: dict[str, Any], config_dir: Path, creator_config: dict[s
             "publish_time": post.publish_time,
             "publish_date": format_publish_date(post.publish_time),
         }
+        restored_entry = state.get_inaccessible_post(post.post_id)
         try:
             detail = fetch_post_detail_api(session, post.post_id)
             title = post_title_from_api(detail)
             post_meta["post_title"] = title
+            post_meta["publish_time"] = int(detail.get("publish_time") or post.publish_time)
+            post_meta["publish_date"] = format_publish_date(int(post_meta["publish_time"]))
             has_right = detail.get("has_right")
             if has_right in {0, False}:
                 default_error = "current account has no right to this post"
@@ -656,35 +1111,63 @@ def run_creator(config: dict[str, Any], config_dir: Path, creator_config: dict[s
                     "status": "no-right",
                     "error": error,
                     "access_requirement": access_requirement,
-                    "notification_status": "already-sent" if already_notified else "pending",
+                    "notification_status": (
+                        "dry-run" if dry_run else "already-sent" if already_notified else "pending"
+                    ),
                     **post_meta,
                 }
                 records.append(record)
-                state.mark_inaccessible(post_meta, error=error, access_requirement=access_requirement)
-                state.save()
-                if already_notified:
-                    print(f"[no-right] {title} (notification already sent)")
+                if dry_run:
+                    print(f"[no-right] {title} (dry-run; state unchanged)")
                 else:
+                    state.mark_inaccessible(post_meta, error=error, access_requirement=access_requirement)
+                    state.save()
+                if not dry_run and already_notified:
+                    print(f"[no-right] {title} (notification already sent)")
+                elif not dry_run:
                     print(f"[no-right] {title} (queued notification; required={access_requirement})")
                     inaccessible_to_notify.append(record)
                 continue
-            restored_entry = state.clear_inaccessible(post.post_id)
             if restored_entry:
-                state.save()
-                print(f"[access-restored] {title}: previous no-right state cleared; checking downloads")
-            candidates = candidates_from_post_detail(detail, include_images=bool(effective.get("include_images", False)))
+                print(f"[access-restored] {title}: access confirmed; checking downloads before clearing state")
+            candidates = candidates_from_post_detail(detail, include_images=include_images)
         except Exception as exc:
             records.append({"status": "detail-failed", **post_meta, "error": str(exc)})
+            if is_feed_post:
+                checkpoint_processing_failed = True
             continue
 
         if not candidates:
             records.append({"status": "no-files", **post_meta})
+            if restored_entry and not dry_run:
+                state.clear_inaccessible(post.post_id)
+                state.save()
+                print(f"[access-restored] {title}: no downloadable files; retry state cleared")
             continue
 
-        post_dir = post_output_dir(download_dir, creator_name, post.publish_time, str(post_meta["post_title"]), post.post_id)
+        post_dir = post_output_dir(
+            download_dir,
+            creator_name,
+            post.publish_time,
+            str(post_meta["post_title"]),
+            post.post_id,
+            creator_id=creator_id,
+        )
         post_records = download_candidates_for_post(session, candidates, post_dir, state, effective, post_meta)
         downloaded += sum(1 for record in post_records if record.get("status") == "downloaded")
         records.extend(post_records)
+        post_statuses = {str(record.get("status") or "") for record in post_records}
+        if is_feed_post and post_statuses & {"failed", "skipped", "detail-failed"}:
+            checkpoint_processing_failed = True
+        if (
+            restored_entry
+            and not dry_run
+            and post_statuses
+            and post_statuses <= {"downloaded", "already-downloaded"}
+        ):
+            state.clear_inaccessible(post.post_id)
+            state.save()
+            print(f"[access-restored] {title}: downloads verified; retry state cleared")
 
     state.save()
     manifest_path = download_dir / "manifest.jsonl"
@@ -702,6 +1185,29 @@ def run_creator(config: dict[str, Any], config_dir: Path, creator_config: dict[s
                 record["notification_status"] = "sent"
             state.save()
     append_manifest(manifest_path, records)
+    can_advance_checkpoint = bool(
+        incremental_enabled
+        and not dry_run
+        and scan.checkpoint_safe
+        and not checkpoint_processing_failed
+        and scan.checkpoint_post_ids
+    )
+    if can_advance_checkpoint:
+        state.mark_creator_scan(
+            creator_id,
+            scan.checkpoint_post_ids,
+            scan.checkpoint_publish_time,
+            full_scan=not bool(known_post_ids),
+            include_images=include_images,
+        )
+        state.save()
+        print(
+            f"[incremental] checkpoint advanced to {scan.checkpoint_post_ids[0]} "
+            f"({len(scan.checkpoint_post_ids)} recent id(s))"
+        )
+    elif incremental_enabled:
+        reason = "dry-run" if dry_run else "post-processing failure" if checkpoint_processing_failed else scan.stop_reason
+        print(f"[incremental] checkpoint unchanged: {reason or 'scan incomplete'}")
     if downloaded:
         bark_notify(
             effective,
@@ -734,12 +1240,16 @@ def run_single_post(config: dict[str, Any], config_dir: Path, post_url: str) -> 
     detail = fetch_post_detail_api(session, post_id)
     title = post_title_from_api(detail)
     creator = detail.get("user") if isinstance(detail.get("user"), dict) else {}
-    creator_name = sanitize_filename(str(creator.get("name") or detail.get("user_id") or "creator"), fallback="creator")
+    creator_id = str(detail.get("user_id") or creator.get("user_id") or "")
+    creator_name = sanitize_filename(
+        str(creator.get("name") or creator_id or "creator"),
+        fallback="creator",
+    )
     creator_avatar = str(creator.get("avatar") or "")
     candidates = candidates_from_post_detail(detail, include_images=bool(config.get("include_images", False)))
 
     post_meta = {
-        "creator_id": str(detail.get("user_id") or ""),
+        "creator_id": creator_id,
         "creator_name": creator_name,
         "post_id": post_id,
         "post_title": title,
@@ -750,7 +1260,14 @@ def run_single_post(config: dict[str, Any], config_dir: Path, post_url: str) -> 
     if not candidates:
         records = [{"status": "no-files", **post_meta}]
     else:
-        post_dir = post_output_dir(download_dir, creator_name, int(detail.get("publish_time") or 0), title, post_id)
+        post_dir = post_output_dir(
+            download_dir,
+            creator_name,
+            int(detail.get("publish_time") or 0),
+            title,
+            post_id,
+            creator_id=creator_id,
+        )
         records = download_candidates_for_post(session, candidates, post_dir, state, config, post_meta)
 
     state.save()

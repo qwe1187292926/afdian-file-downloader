@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse, unquote
+from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlparse, urlunparse, unquote
 
 import requests
 try:
@@ -124,6 +124,7 @@ class Candidate:
     text: str = ""
     referer: str = ""
     filename_hint: str = ""
+    asset_locator: str = ""
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,16 @@ class FeedPost:
     publish_sn: str
     url: str
     raw: dict[str, object]
+
+
+@dataclass(frozen=True)
+class FeedScanResult:
+    posts: list[FeedPost]
+    checkpoint_post_ids: list[str]
+    checkpoint_publish_time: int
+    incremental_boundary_reached: bool
+    checkpoint_safe: bool
+    stop_reason: str
 
 
 def eprint(message: str) -> None:
@@ -160,6 +171,14 @@ def slug_from_text(text: str, fallback: str) -> str:
     text = sanitize_filename(text, fallback=fallback)
     text = re.sub(r"\s+", "-", text)
     return text[:80] or fallback
+
+
+def stable_id_component(value: str, fallback: str) -> str:
+    raw = str(value or "").strip()
+    identity = raw or fallback
+    prefix = slug_from_text(identity, fallback=fallback)[:24]
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    return f"{prefix}-{digest}"
 
 
 def clean_post_title(title: str) -> str:
@@ -215,6 +234,100 @@ def format_publish_date(timestamp: int) -> str:
         return "unknown-date"
     tz = timezone(timedelta(hours=8))
     return datetime.fromtimestamp(timestamp, tz=tz).strftime("%Y-%m-%d")
+
+
+def creator_directory_name(creator_name: str, creator_id: str) -> str:
+    del creator_name
+    identity = stable_id_component(creator_id, fallback="unknown-creator")
+    return f"creator-{identity}"
+
+
+def post_directory_name(publish_time: int, title: str, post_id: str) -> str:
+    del publish_time, title
+    identity = stable_id_component(post_id, fallback="unknown-post")
+    return f"post-{identity}"
+
+
+def signed_query_keys_to_remove(query_items: list[tuple[str, str]]) -> set[str]:
+    keys = {key.lower() for key, _value in query_items}
+    removable: set[str] = set()
+    aws_required = {
+        "x-amz-algorithm",
+        "x-amz-credential",
+        "x-amz-date",
+        "x-amz-expires",
+        "x-amz-signedheaders",
+        "x-amz-signature",
+    }
+    google_required = {
+        "x-goog-algorithm",
+        "x-goog-credential",
+        "x-goog-date",
+        "x-goog-expires",
+        "x-goog-signedheaders",
+        "x-goog-signature",
+    }
+    cos_required = {
+        "q-sign-algorithm",
+        "q-ak",
+        "q-sign-time",
+        "q-key-time",
+        "q-header-list",
+        "q-url-param-list",
+        "q-signature",
+    }
+    if aws_required <= keys:
+        removable.update(key for key in keys if key.startswith("x-amz-"))
+    if google_required <= keys:
+        removable.update(key for key in keys if key.startswith("x-goog-"))
+    if cos_required <= keys:
+        removable.update(
+            key
+            for key in keys
+            if key.startswith("q-sign-")
+            or key in {"q-ak", "q-key-time", "q-header-list", "q-url-param-list"}
+        )
+    if {"ossaccesskeyid", "expires", "signature"} <= keys:
+        removable.update(
+            {
+                "ossaccesskeyid",
+                "signature",
+                "expires",
+                "security-token",
+                "x-oss-security-token",
+            }
+            & keys
+        )
+    if {"signature", "key-pair-id"} <= keys and ({"expires", "policy"} & keys):
+        removable.update({"signature", "key-pair-id", "policy", "expires"} & keys)
+    return removable
+
+
+def canonical_candidate_url(url: str) -> str:
+    parsed = urlparse(url)
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    removable_keys = signed_query_keys_to_remove(query_items)
+    stable_query = [
+        (key, value)
+        for key, value in query_items
+        if key.lower() not in removable_keys
+    ]
+    return urlunparse(
+        parsed._replace(
+            scheme=parsed.scheme.lower(),
+            netloc=parsed.netloc.lower(),
+            query=urlencode(stable_query),
+            fragment="",
+        )
+    )
+
+
+def candidate_identity(candidate: Candidate) -> str:
+    canonical_url = canonical_candidate_url(candidate.url)
+    locator = candidate.asset_locator.strip()
+    if locator:
+        return f"locator:{locator}|url:{canonical_url}"
+    return f"url:{canonical_url}"
 
 
 def api_get_json(session: requests.Session, path: str, params: dict[str, object] | None = None) -> dict[str, object]:
@@ -361,20 +474,19 @@ def dedupe_candidates(candidates: Iterable[Candidate]) -> list[Candidate]:
     result: list[Candidate] = []
     for candidate in candidates:
         url = candidate.url.split("#", 1)[0]
-        parsed = urlparse(url)
-        key = urlunparse(parsed._replace(query="", fragment=""))
+        normalized = Candidate(
+            url=url,
+            source=candidate.source,
+            text=candidate.text,
+            referer=candidate.referer,
+            filename_hint=candidate.filename_hint,
+            asset_locator=candidate.asset_locator,
+        )
+        key = candidate_identity(normalized)
         if not url or key in seen:
             continue
         seen.add(key)
-        result.append(
-            Candidate(
-                url=url,
-                source=candidate.source,
-                text=candidate.text,
-                referer=candidate.referer,
-                filename_hint=candidate.filename_hint,
-            )
-        )
+        result.append(normalized)
     return result
 
 
@@ -389,6 +501,7 @@ def with_filename_hint(candidates: Iterable[Candidate], filename_hint: str) -> l
                 text=candidate.text,
                 referer=candidate.referer,
                 filename_hint=candidate.filename_hint or hint,
+                asset_locator=candidate.asset_locator,
             )
         )
     return result
@@ -548,7 +661,7 @@ def feed_post_from_api(raw: dict[str, object]) -> FeedPost:
     )
 
 
-def iter_feed_posts_api(
+def scan_feed_posts_api(
     session: requests.Session,
     creator_user_id: str,
     max_posts: int,
@@ -556,10 +669,19 @@ def iter_feed_posts_api(
     until_ts: int | None,
     stop_post_id: str,
     per_page: int,
-) -> list[FeedPost]:
+    known_post_ids: set[str] | None = None,
+    incremental_lookback: int = 0,
+    checkpoint_id_limit: int = 50,
+) -> FeedScanResult:
     posts: list[FeedPost] = []
     publish_sn = ""
     seen_ids: set[str] = set()
+    known_ids = set(known_post_ids or ())
+    checkpoint_post_times: dict[str, int] = {}
+    incremental_boundary_reached = False
+    lookback_remaining = 0
+    checkpoint_safe = False
+    stop_reason = ""
 
     while True:
         data = api_get_json(
@@ -580,11 +702,16 @@ def iter_feed_posts_api(
         )
         payload = data.get("data") or {}
         raw_list = payload.get("list") if isinstance(payload, dict) else []
+        if not isinstance(raw_list, list):
+            raise RuntimeError("Ifdian feed API returned a non-list data.list payload")
         if not raw_list:
+            checkpoint_safe = True
+            stop_reason = "feed-exhausted"
             break
 
         oldest_seen_sn = ""
         stop_due_to_boundary = False
+        new_ids_on_page = 0
         for raw in raw_list:
             if not isinstance(raw, dict):
                 continue
@@ -592,10 +719,13 @@ def iter_feed_posts_api(
             if not post.post_id or post.post_id in seen_ids:
                 continue
             seen_ids.add(post.post_id)
+            new_ids_on_page += 1
             oldest_seen_sn = post.publish_sn or oldest_seen_sn
 
             if stop_post_id and post.post_id == stop_post_id:
                 stop_due_to_boundary = True
+                checkpoint_safe = True
+                stop_reason = "configured-stop-post"
                 break
             if until_ts is not None and post.publish_time > until_ts:
                 continue
@@ -603,24 +733,90 @@ def iter_feed_posts_api(
                 if raw.get("user_top"):
                     continue
                 stop_due_to_boundary = True
+                checkpoint_safe = True
+                stop_reason = "since-boundary"
                 break
 
+            is_pinned = bool(raw.get("user_top"))
+            if not is_pinned:
+                checkpoint_post_times[post.post_id] = post.publish_time
             posts.append(post)
+
+            if known_ids and not is_pinned and post.post_id in known_ids and not incremental_boundary_reached:
+                incremental_boundary_reached = True
+                lookback_remaining = max(0, incremental_lookback)
+                if lookback_remaining == 0:
+                    stop_due_to_boundary = True
+                    checkpoint_safe = True
+                    stop_reason = "incremental-boundary"
+                    break
+            elif incremental_boundary_reached and not is_pinned:
+                lookback_remaining -= 1
+                if lookback_remaining <= 0:
+                    stop_due_to_boundary = True
+                    checkpoint_safe = True
+                    stop_reason = "incremental-lookback-complete"
+                    break
+
             if max_posts and len(posts) >= max_posts:
                 stop_due_to_boundary = True
+                checkpoint_safe = incremental_boundary_reached
+                stop_reason = "max-posts"
                 break
 
         if stop_due_to_boundary:
             break
 
-        publish_sn = oldest_seen_sn or str(raw_list[-1].get("publish_sn") or "")
-        has_more = payload.get("has_more") if isinstance(payload, dict) else None
-        if has_more in {0, False}:
-            break
-        if not publish_sn:
-            break
+        if new_ids_on_page == 0:
+            raise RuntimeError(f"Ifdian feed pagination made no progress at cursor {publish_sn!r}")
 
-    return posts
+        last_item = raw_list[-1] if isinstance(raw_list[-1], dict) else {}
+        next_publish_sn = oldest_seen_sn or str(last_item.get("publish_sn") or "")
+        has_more = payload.get("has_more") if isinstance(payload, dict) else None
+        if has_more in {0, False, "0", "false", "False"}:
+            checkpoint_safe = True
+            stop_reason = "feed-exhausted"
+            break
+        if not next_publish_sn:
+            raise RuntimeError("Ifdian feed API reported more pages without a publish_sn cursor")
+        if next_publish_sn == publish_sn:
+            raise RuntimeError(f"Ifdian feed pagination cursor did not advance from {publish_sn!r}")
+        publish_sn = next_publish_sn
+
+    checkpoint_post_ids = sorted(
+        checkpoint_post_times,
+        key=lambda post_id: checkpoint_post_times[post_id],
+        reverse=True,
+    )[: max(1, checkpoint_id_limit)]
+    checkpoint_publish_time = checkpoint_post_times.get(checkpoint_post_ids[0], 0) if checkpoint_post_ids else 0
+    return FeedScanResult(
+        posts=posts,
+        checkpoint_post_ids=checkpoint_post_ids,
+        checkpoint_publish_time=checkpoint_publish_time,
+        incremental_boundary_reached=incremental_boundary_reached,
+        checkpoint_safe=checkpoint_safe,
+        stop_reason=stop_reason,
+    )
+
+
+def iter_feed_posts_api(
+    session: requests.Session,
+    creator_user_id: str,
+    max_posts: int,
+    since_ts: int | None,
+    until_ts: int | None,
+    stop_post_id: str,
+    per_page: int,
+) -> list[FeedPost]:
+    return scan_feed_posts_api(
+        session=session,
+        creator_user_id=creator_user_id,
+        max_posts=max_posts,
+        since_ts=since_ts,
+        until_ts=until_ts,
+        stop_post_id=stop_post_id,
+        per_page=per_page,
+    ).posts
 
 
 def find_named_value(data: dict[str, object], names: tuple[str, ...]) -> str:
@@ -642,7 +838,15 @@ def attachment_candidates_from_value(
     if isinstance(value, str):
         url = normalize_url(value, base_url)
         if url and looks_like_download_url(url, include_images):
-            candidates.append(Candidate(url=url, source=source, referer=base_url, filename_hint=filename_hint))
+            candidates.append(
+                Candidate(
+                    url=url,
+                    source=source,
+                    referer=base_url,
+                    filename_hint=filename_hint,
+                    asset_locator=source,
+                )
+            )
         return candidates
 
     if isinstance(value, list):
@@ -674,7 +878,15 @@ def attachment_candidates_from_value(
                 continue
             url = normalize_url(item_value, base_url)
             if url and looks_like_download_url(url, include_images):
-                candidates.append(Candidate(url=url, source=f"{source}.{key}", referer=base_url, filename_hint=item_hint))
+                candidates.append(
+                    Candidate(
+                        url=url,
+                        source=f"{source}.{key}",
+                        referer=base_url,
+                        filename_hint=item_hint,
+                        asset_locator=source,
+                    )
+                )
         return candidates
 
     return candidates
@@ -691,7 +903,15 @@ def candidates_from_post_detail(post: dict[str, object], include_images: bool) -
         if isinstance(value, str) and value.strip():
             url = normalize_url(value, post_url)
             if url:
-                candidates.append(Candidate(url=url, source=f"api:{field}", referer=post_url, filename_hint=title))
+                candidates.append(
+                    Candidate(
+                        url=url,
+                        source=f"api:{field}",
+                        referer=post_url,
+                        filename_hint=title,
+                        asset_locator=f"api:{field}",
+                    )
+                )
 
     candidates.extend(
         attachment_candidates_from_value(
@@ -759,7 +979,11 @@ def filename_suffix_from_url_or_headers(url: str, headers: dict[str, str]) -> st
 
 def filename_from_url(url: str, headers: dict[str, str], preferred_stem: str = "") -> str:
     if preferred_stem:
-        return sanitize_filename(preferred_stem) + filename_suffix_from_url_or_headers(url, headers)
+        filename = sanitize_filename(preferred_stem)
+        suffix = filename_suffix_from_url_or_headers(url, headers)
+        if suffix and filename.lower().endswith(suffix.lower()):
+            return filename
+        return filename + suffix
 
     header_name = filename_from_headers(headers)
     if header_name:

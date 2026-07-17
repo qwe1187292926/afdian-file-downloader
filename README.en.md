@@ -45,9 +45,11 @@ This tool does not bypass paywalls, CAPTCHA, permission checks, or DRM. It only 
 - Batch downloads from creator feed pages.
 - Single-post downloads by URL.
 - `since` / `until` date boundaries.
-- File and folder names based on post titles.
-- `download_state.json` deduplication for safe reruns.
-- Filesystem fallback when the state file is missing.
+- Incremental creator-feed scans by default, with periodic full rescans.
+- Stable creator-ID and post-ID directories, so creator renames and post title or publish-time edits do not change paths.
+- Readable filenames based on post or attachment titles, with post and file mappings stored in `.afdian-post.json`.
+- Stable v2 asset identity in `download_state.json`, with compatible migration of legacy state.
+- Sidecar and expected-filename fallback when the state file is missing.
 - Average download speed printed after each file.
 - Bark notifications with downloaded titles in the message body.
 - One-time Bark alerts for new creator posts that your current tier cannot access, with state tracking to avoid repeated alerts.
@@ -127,6 +129,9 @@ Example `config.json`:
   "since": "",
   "until": "",
   "stop_post_id": "",
+  "incremental_scan": true,
+  "incremental_lookback_posts": 20,
+  "incremental_full_scan_days": 30,
   "creators": [
     {
       "url": "https://ifdian.net/a/creator?tab=feed",
@@ -159,11 +164,20 @@ Example `config.json`:
 | `include_images` | Whether to download image resources. Default is `false` to avoid avatars and covers. |
 | `overwrite` | Whether to overwrite existing files. Default is `false`. |
 | `skip_existing` | Whether to skip existing downloads. Default is `true`. |
-| `dry_run` | Preview mode. Detect files without writing them. |
+| `dry_run` | Preview mode. It does not download content, advance incremental checkpoints, or clear inaccessible-post state. Runtime state and manifest files may still be created or recorded. |
+| `timeout` | Timeout in seconds for each download request. Default is `60`. |
+| `per_page` | Number of creator posts requested per API page. Default is `10`. |
+| `max_posts` | Maximum posts to process in one run; `0` means unlimited. A nonzero value is a manual scan boundary and disables automatic incremental checkpoints. |
 | `since` / `until` | Global date boundaries. Supports `YYYY-MM-DD` and `YYYYMMDD`. |
+| `stop_post_id` | Stop when this post ID is reached. An empty string means unset; a nonempty value disables automatic incremental checkpoints. |
+| `incremental_scan` | Enable automatic incremental creator-feed scanning. It must be a JSON boolean and defaults to `true`. |
+| `incremental_lookback_posts` | Number of non-pinned posts to keep scanning after a known checkpoint is reached. Default is `20`; negative values are treated as `0`. |
+| `incremental_full_scan_days` | Days between periodic full rescans. Default is `30`; `0` disables periodic full rescans, but the first run is still full. |
 | `creators` | Creator feed URLs for batch downloads. |
 | `single_posts` | Post URLs for one-off downloads. |
 | `bark` | Bark notification settings. |
+
+Fields inside a `creators` entry override global fields with the same name, so each creator can use different date boundaries or scan settings.
 
 ## Download Creator Posts
 
@@ -186,19 +200,40 @@ Startup output includes resolved configuration:
 [config] download_dir=...
 [config] state_file=...
 [config] manifest=...
-[config] options={...}
+[config] options={..., "incremental_scan": true, "incremental_lookback_posts": 20, "incremental_full_scan_days": 30}
+[incremental] mode=full|incremental, lookback_posts=20, full_scan_days=30
 ```
 
 Output example:
 
 ```text
 downloads/
-  Creator Name/
-    2026-06-27-Post Title/
+  creator-<safe ID token>/
+    post-<safe ID token>/
+      .afdian-post.json
       Post Title.mp4
   download_state.json
   manifest.jsonl
 ```
+
+Directory tokens are derived only from stable IDs, using a sanitized short prefix plus a 12-character SHA-256 digest. A creator rename, post title edit, or publish-time edit therefore continues to use the same path. `.afdian-post.json` in each new post directory stores the full IDs, current title, URL, publish time, and the mapping from assets to relative filenames.
+
+## Incremental Scanning
+
+`incremental_scan` defaults to `true`. When no usable checkpoint exists, normally on the first run, the script scans every visible post for the creator and stores recent non-pinned post IDs. Later runs start from the newest page, stop after reaching any known checkpoint plus `incremental_lookback_posts` additional non-pinned posts, and then save the new checkpoint. Pinned posts are processed normally, but they neither establish a checkpoint nor consume the lookback count.
+
+A full rescan runs every `incremental_full_scan_days=30` days by default. Setting it to `0` disables only periodic full rescans; the initial scan is still full. Changing `include_images` or encountering a checkpoint from an older asset-identity version also forces a full scan.
+
+Any of the following disables automatic incremental checkpoints and performs a normal scan under the active configuration:
+
+- `since`, `until`, a nonzero `max_posts`, or `stop_post_id` is set;
+- `skip_existing=false`;
+- `overwrite=true`;
+- `incremental_scan=false`.
+
+Posts persisted in `inaccessible_posts` are retried separately even when they fall outside the incremental window, so restored access to an old post can still be detected. The entry is cleared only after the post is confirmed to have no downloadable files, or every candidate is downloaded/already downloaded. A failure, skip, or preview run keeps the entry.
+
+A checkpoint advances only after the scan ends safely, the manifest is written, and no feed post has a detail failure, download failure, or skipped result. `dry_run` may read an existing checkpoint to reduce the scan range, but never advances it.
 
 ## Download One Post
 
@@ -216,21 +251,27 @@ python download_post.py
 
 ## Deduplication
 
-`download_state.json` stores downloaded file state and inaccessible-post alert state. It is created at startup and saved immediately after every successful download, local-file skip, or newly detected inaccessible post.
+`download_state.json` stores downloaded file state, creator incremental checkpoints, and inaccessible-post alert state. It is created at startup and saved immediately after every successful download, local-file skip, or newly detected inaccessible post.
 
-The primary key is based on:
+The current v2 asset key is SHA-256 hashed from stable identity inputs:
 
 ```text
-post_id + download URL + filename hint
+post_id + (asset locator when available) + canonical download URL
 ```
 
-If the state file is missing, the script checks existing files in the target post directory. Multiple same-name files in one post are matched by order:
+Post titles and mutable filename hints are not part of the asset identity. URL canonicalization removes the fragment and removes signature fields only when a complete recognized AWS, Google Cloud, Tencent COS, Alibaba OSS, or CloudFront signing family is present. Unknown standalone query parameters such as `sign` or `token` are retained so genuinely different assets are not accidentally merged.
+
+Legacy v1/v0 state is migrated lazily when it is encountered again. A v2 alias is created only when the old key or URL match is unambiguous, the current canonical URL has no remaining functional or unknown query, the referenced file still exists, and the same physical path has not already been claimed by another v2 asset. One legacy file is never assigned to two new assets. A legacy query-bearing entry that cannot be proven equivalent is safely downloaded once again. Old title-based directories are not renamed automatically; they remain recognized when legacy state still points to their files.
+
+If the state file is missing, the script first uses `.afdian-post.json` in the ID-based post directory to find the exact relative filename, then falls back to the expected filename. Multiple same-name files in one post are matched by order:
 
 ```text
 1st file -> title.mp4
 2nd file -> title-1.mp4
 3rd file -> title-2.mp4
 ```
+
+The sidecar validates the creator ID and post ID and accepts only one-level relative filenames inside the post directory. To avoid claiming unrelated user files, a nonempty ID-based post directory without `.afdian-post.json` is refused and recorded as a failure.
 
 If a creator post cannot be viewed because the current account does not have the required paid tier, the script records it under `inaccessible_posts`. Later runs do not repeat the alert while the post is still inaccessible. If you upgrade your tier and the post becomes accessible, the script clears that inaccessible state and proceeds through the normal download flow.
 
@@ -259,8 +300,9 @@ When a creator has a new post that cannot be downloaded with the current account
 
 | File | Description |
 | --- | --- |
-| `download_state.json` | Deduplication state, plus inaccessible-post alert state. |
+| `download_state.json` | v2 deduplication state, creator incremental checkpoints, and inaccessible-post alert state. |
 | `manifest.jsonl` | Detailed records for successful, skipped, and failed items. |
+| `creator-<safe ID token>/post-<safe ID token>/.afdian-post.json` | Post metadata and the mapping from v2 asset keys to safe relative filenames, used for filesystem fallback. |
 | `*.part` | Temporary file during download. |
 
 ## Optional Browser Mode
@@ -274,11 +316,21 @@ pip install -r requirements-browser.txt
 python -m playwright install chromium
 ```
 
+## Development Verification
+
+After changing the code, run the built-in regression tests and syntax check:
+
+```powershell
+python -m unittest discover -s tests -v
+python -m py_compile .\afdian_downloader.py .\afdian_config_common.py .\download_creators.py .\download_post.py
+```
+
 ## Notes
 
 - Do not commit `config.json`, `cookies.txt`, `download_state.json`, `manifest.jsonl`, or downloaded files.
 - Refresh your Cookie when it expires.
-- Without `since`, `until`, `max_posts`, or `stop_post_id`, the script tries to scan every visible post for the configured creator.
+- In the default incremental mode, the first run scans every visible post; later runs scan from the newest post to the checkpoint plus lookback. Only disabling incremental mode makes every boundary-free run scan the full visible feed.
+- Setting any manual boundary disables automatic incremental checkpoints, preventing a limited scan from incorrectly advancing the global checkpoint.
 - Platform API changes may require script updates.
 
 ## Author
