@@ -46,7 +46,7 @@ This tool does not bypass paywalls, CAPTCHA, permission checks, or DRM. It only 
 - Single-post downloads by URL.
 - `since` / `until` date boundaries.
 - Incremental creator-feed scans by default, with periodic full rescans.
-- Stable creator-ID and post-ID directories, so creator renames and post title or publish-time edits do not change paths.
+- Readable `creator name / publish date-post title` directories; a short post identity is appended only for a confirmed post conflict or when an existing nonempty directory cannot be claimed safely.
 - Readable filenames based on post or attachment titles, with post and file mappings stored in `.afdian-post.json`.
 - Stable v2 asset identity in `download_state.json`, with compatible migration of legacy state.
 - Sidecar and expected-filename fallback when the state file is missing.
@@ -208,15 +208,17 @@ Output example:
 
 ```text
 downloads/
-  creator-<safe ID token>/
-    post-<safe ID token>/
+  Creator Name/
+    2026-07-18-Post-Title/
       .afdian-post.json
       Post Title.mp4
   download_state.json
   manifest.jsonl
 ```
 
-Directory tokens are derived only from stable IDs, using a sanitized short prefix plus a 12-character SHA-256 digest. A creator rename, post title edit, or publish-time edit therefore continues to use the same path. `.afdian-post.json` in each new post directory stores the full IDs, current title, URL, publish time, and the mapping from assets to relative filenames.
+Normal directories keep the pre-upgrade readable layout: the creator directory uses the creator name, and the post directory uses the publish date and post title. Creator batch runs keep using the feed publish time, while the single-post entry point keeps using the publish time returned by the detail API. Stable post and asset identities stay inside `download_state.json` and `.afdian-post.json` instead of appearing in everyday folder names. A post uses `date-title--short-post-identity` only when an existing sidecar proves that the preferred readable directory belongs to another post, or when an existing nonempty directory cannot be claimed safely. Each claimed post directory stores full IDs, current title, URL, publish time, and asset-to-filename mappings in its sidecar.
+
+This version does not automatically move the short-lived ID-only `creator-.../post-...` directories. After confirming that they contain duplicates, you may delete them directly. When those state paths no longer exist, the downloader falls back to the pre-upgrade readable directory and refreshes the v2 state to the existing old file without downloading it again.
 
 ## Incremental Scanning
 
@@ -261,9 +263,9 @@ post_id + (asset locator when available) + canonical download URL
 
 Post titles and mutable filename hints are not part of the asset identity. URL canonicalization removes the fragment and removes signature fields only when a complete recognized AWS, Google Cloud, Tencent COS, Alibaba OSS, or CloudFront signing family is present. Unknown standalone query parameters such as `sign` or `token` are retained so genuinely different assets are not accidentally merged.
 
-Legacy v1/v0 state is migrated lazily when it is encountered again. A v2 alias is created only when the old key or URL match is unambiguous, the current canonical URL has no remaining functional or unknown query, the referenced file still exists, and the same physical path has not already been claimed by another v2 asset. One legacy file is never assigned to two new assets. A legacy query-bearing entry that cannot be proven equivalent is safely downloaded once again. Old title-based directories are not renamed automatically; they remain recognized when legacy state still points to their files.
+Legacy v1/v0 state is migrated lazily. To avoid redownloading files created before this upgrade, a unique exact v1/v0 key in the current candidate set reuses the original readable-path file even when the current URL contains query fields that the old algorithm could not distinguish. A shared ambiguous old key is still rejected. URL-only fuzzy migration is considered only when there is no exact legacy key and the canonical URL has no remaining functional query. The referenced file must still exist, and one physical path cannot be claimed by different posts or asset locators.
 
-If the state file is missing, the script first uses `.afdian-post.json` in the ID-based post directory to find the exact relative filename, then falls back to the expected filename. Multiple same-name files in one post are matched by order:
+If the state file is missing, the script first uses `.afdian-post.json` in the readable post directory. A pre-upgrade directory without a sidecar is checked only for exact direct-child expected filenames; after a match, the v2 state and sidecar are added without moving or renaming the old file. Multiple same-name files in one post are matched by order:
 
 ```text
 1st file -> title.mp4
@@ -271,7 +273,7 @@ If the state file is missing, the script first uses `.afdian-post.json` in the I
 3rd file -> title-2.mp4
 ```
 
-The sidecar validates the creator ID and post ID and accepts only one-level relative filenames inside the post directory. To avoid claiming unrelated user files, a nonempty ID-based post directory without `.afdian-post.json` is refused and recorded as a failure.
+Legacy doubled-extension names such as `archive.zip.zip` and `archive.zip-1.zip` are also recognized. The sidecar validates creator and post IDs and accepts only direct relative filenames inside the post directory. A nonempty sidecar-less directory is claimed only when old state points to a file for this post inside it, or at least one exact expected filename exists. Otherwise the original directory is preserved and new files use a readable collision directory with a short post identity.
 
 If a creator post cannot be viewed because the current account does not have the required paid tier, the script records it under `inaccessible_posts`. Later runs do not repeat the alert while the post is still inaccessible. If you upgrade your tier and the post becomes accessible, the script clears that inaccessible state and proceeds through the normal download flow.
 
@@ -302,7 +304,7 @@ When a creator has a new post that cannot be downloaded with the current account
 | --- | --- |
 | `download_state.json` | v2 deduplication state, creator incremental checkpoints, and inaccessible-post alert state. |
 | `manifest.jsonl` | Detailed records for successful, skipped, and failed items. |
-| `creator-<safe ID token>/post-<safe ID token>/.afdian-post.json` | Post metadata and the mapping from v2 asset keys to safe relative filenames, used for filesystem fallback. |
+| `Creator Name/YYYY-MM-DD-Post-Title/.afdian-post.json` | Post metadata and the mapping from v2 asset keys to safe relative filenames, used for filesystem fallback. |
 | `*.part` | Temporary file during download. |
 
 ## Optional Browser Mode

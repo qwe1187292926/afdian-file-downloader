@@ -19,6 +19,7 @@ from afdian_downloader import (
     candidate_identity,
     candidates_from_post_detail,
     canonical_candidate_url,
+    collision_directory_name,
     creator_directory_name,
     create_base_session,
     download_candidate,
@@ -168,16 +169,57 @@ class DownloadState:
         if not isinstance(entry, dict):
             return False
         file_path = entry.get("path")
-        return bool(file_path and Path(file_path).exists())
+        return bool(file_path and Path(file_path).is_file())
 
     def get_existing_entry(self, key: str) -> dict[str, Any] | None:
         entry = self.data.get("downloads", {}).get(key)
         if not isinstance(entry, dict):
             return None
         file_path = entry.get("path")
-        if file_path and Path(file_path).exists():
+        if file_path and Path(file_path).is_file():
             return entry
         return None
+
+    def has_post_file_in_directory(self, post_id: str, output_dir: Path) -> bool:
+        expected_parent = output_dir.resolve()
+        for entry in self.data.get("downloads", {}).values():
+            if not isinstance(entry, dict) or str(entry.get("post_id") or "") != post_id:
+                continue
+            file_path = str(entry.get("path") or "")
+            if not file_path or not Path(file_path).is_file():
+                continue
+            if Path(file_path).resolve().parent == expected_parent:
+                return True
+        return False
+
+    def path_claimed_by_other_v2_asset(
+        self,
+        path: str,
+        asset_key: str,
+        post_id: str,
+        asset_locator: str,
+    ) -> bool:
+        target_path = file_claim_key(path)
+        for existing_key, entry in self.data.get("downloads", {}).items():
+            if (
+                not isinstance(entry, dict)
+                or entry.get("identity_version") != ASSET_IDENTITY_VERSION
+                or str(existing_key) == asset_key
+            ):
+                continue
+            existing_path = str(entry.get("path") or "")
+            if not existing_path or not Path(existing_path).is_file():
+                continue
+            if file_claim_key(existing_path) != target_path:
+                continue
+            same_logical_asset = bool(
+                asset_locator
+                and str(entry.get("post_id") or "") == post_id
+                and str(entry.get("asset_locator") or "") == asset_locator
+            )
+            if not same_logical_asset:
+                return True
+        return False
 
     def alias(
         self,
@@ -228,7 +270,14 @@ class DownloadState:
             if legacy_canonical_download_url(str(entry.get("url") or "")) != target_url:
                 continue
             path = str(entry.get("path") or "")
-            if not path or file_claim_key(path) in claimed_paths or not Path(path).exists():
+            if not path or file_claim_key(path) in claimed_paths or not Path(path).is_file():
+                continue
+            if self.path_claimed_by_other_v2_asset(
+                path,
+                download_key(post_id, candidate),
+                post_id,
+                candidate.asset_locator,
+            ):
                 continue
             matches.append((str(existing_key), entry))
         return matches[0] if len(matches) == 1 else None
@@ -577,6 +626,19 @@ def post_sidecar_path(output_dir: Path) -> Path:
     return output_dir / POST_SIDECAR_NAME
 
 
+def load_post_sidecar(output_dir: Path) -> dict[str, Any] | None:
+    path = post_sidecar_path(output_dir)
+    if not path.exists():
+        return None
+    try:
+        sidecar = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not read post sidecar {path}: {exc}") from exc
+    if not isinstance(sidecar, dict):
+        raise RuntimeError(f"Post sidecar must be a JSON object: {path}")
+    return sidecar
+
+
 def new_post_sidecar(post_meta: dict[str, Any]) -> dict[str, Any]:
     timestamp = now_iso()
     return {
@@ -628,15 +690,11 @@ def claim_post_directory(
     output_dir: Path,
     post_meta: dict[str, Any],
     dry_run: bool,
+    allow_nonempty_without_sidecar: bool = False,
 ) -> dict[str, Any] | None:
-    path = post_sidecar_path(output_dir)
-    if path.exists():
-        try:
-            sidecar = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Could not read post sidecar {path}: {exc}") from exc
-        if not isinstance(sidecar, dict):
-            raise RuntimeError(f"Post sidecar must be a JSON object: {path}")
+    sidecar = load_post_sidecar(output_dir)
+    if sidecar is not None:
+        path = post_sidecar_path(output_dir)
         validate_post_sidecar(sidecar, post_meta, path)
         sidecar["creator"]["name"] = str(post_meta.get("creator_name") or "")
         sidecar["post"].update(
@@ -652,7 +710,7 @@ def claim_post_directory(
 
     if dry_run:
         return None
-    if output_dir.exists() and any(output_dir.iterdir()):
+    if output_dir.exists() and any(output_dir.iterdir()) and not allow_nonempty_without_sidecar:
         raise RuntimeError(
             f"Refusing to claim non-empty post directory without {POST_SIDECAR_NAME}: {output_dir}"
         )
@@ -742,31 +800,83 @@ def expected_filename_for_candidate(candidate: Candidate, duplicate_index: int) 
     return f"{stem}-{duplicate_index}{suffix}"
 
 
+def legacy_expected_filename_for_candidate(candidate: Candidate, duplicate_index: int) -> str | None:
+    stem = sanitize_filename(candidate.filename_hint, fallback="download")
+    suffix = Path(unquote(urlparse(candidate.url).path)).suffix
+    if not suffix or len(suffix) > 16:
+        return None
+    if duplicate_index <= 0:
+        return f"{stem}{suffix}"
+    return f"{stem}-{duplicate_index}{suffix}"
+
+
+def expected_candidate_paths(output_dir: Path, candidate: Candidate, duplicate_index: int) -> list[Path]:
+    names = [
+        expected_filename_for_candidate(candidate, duplicate_index),
+        legacy_expected_filename_for_candidate(candidate, duplicate_index),
+    ]
+    paths: list[Path] = []
+    seen_names: set[str] = set()
+    for name in names:
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        paths.append(output_dir / name)
+    return paths
+
+
+def is_safe_direct_child_file(output_dir: Path, path: Path) -> bool:
+    try:
+        return path.is_file() and path.resolve().parent == output_dir.resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def legacy_directory_has_candidate_artifact(output_dir: Path, candidates: list[Candidate]) -> bool:
+    if not output_dir.is_dir():
+        return False
+    duplicate_counts: dict[tuple[str, str], int] = {}
+    for candidate in candidates:
+        signature = candidate_name_signature(candidate)
+        duplicate_index = duplicate_counts.get(signature, 0)
+        duplicate_counts[signature] = duplicate_index + 1
+        for path in expected_candidate_paths(output_dir, candidate, duplicate_index):
+            if is_safe_direct_child_file(output_dir, path):
+                return True
+            part_path = path.with_suffix(path.suffix + ".part")
+            if is_safe_direct_child_file(output_dir, part_path):
+                return True
+    return False
+
+
 def existing_candidate_file(
     output_dir: Path,
     candidate: Candidate,
     duplicate_index: int,
     asset_key: str,
     sidecar: dict[str, Any] | None,
+    allow_legacy_fallback: bool = False,
 ) -> Path | None:
-    if not output_dir.exists() or sidecar is None:
+    if not output_dir.exists():
         return None
 
-    recorded = safe_sidecar_asset_path(output_dir, sidecar, asset_key)
-    if recorded:
-        return recorded
-
-    expected_name = expected_filename_for_candidate(candidate, duplicate_index)
-    if not expected_name:
+    if sidecar is not None:
+        recorded = safe_sidecar_asset_path(output_dir, sidecar, asset_key)
+        if recorded:
+            return recorded
+    elif not allow_legacy_fallback:
         return None
 
-    exact = output_dir / expected_name
-    if exact.is_file() and not sidecar_path_is_claimed_by_other_asset(
-        output_dir,
-        sidecar,
-        asset_key,
-        exact,
-    ):
+    for exact in expected_candidate_paths(output_dir, candidate, duplicate_index):
+        if not is_safe_direct_child_file(output_dir, exact):
+            continue
+        if sidecar is not None and sidecar_path_is_claimed_by_other_asset(
+            output_dir,
+            sidecar,
+            asset_key,
+            exact,
+        ):
+            continue
         return exact
     return None
 
@@ -818,22 +928,42 @@ def compatible_state_entry(
         if path and file_claim_key(path) not in claimed_paths:
             return key, exact
 
-    if urlparse(canonical_download_url(candidate.url)).query:
-        return None
-
     v1_key = download_key_v1(post_id, candidate)
     if v1_counts[v1_key] == 1:
         entry = state.get_existing_entry(v1_key)
         path = str(entry.get("path") or "") if entry else ""
-        if entry and path and file_claim_key(path) not in claimed_paths:
+        if (
+            entry
+            and path
+            and file_claim_key(path) not in claimed_paths
+            and not state.path_claimed_by_other_v2_asset(
+                path,
+                key,
+                post_id,
+                candidate.asset_locator,
+            )
+        ):
             return v1_key, entry
 
     v0_key = legacy_download_key(post_id, candidate)
     if v0_counts[v0_key] == 1:
         entry = state.get_existing_entry(v0_key)
         path = str(entry.get("path") or "") if entry else ""
-        if entry and path and file_claim_key(path) not in claimed_paths:
+        if (
+            entry
+            and path
+            and file_claim_key(path) not in claimed_paths
+            and not state.path_claimed_by_other_v2_asset(
+                path,
+                key,
+                post_id,
+                candidate.asset_locator,
+            )
+        ):
             return v0_key, entry
+
+    if urlparse(canonical_download_url(candidate.url)).query:
+        return None
 
     legacy_url = legacy_canonical_download_url(candidate.url)
     if legacy_url_counts[legacy_url] == 1:
@@ -863,6 +993,21 @@ def download_candidates_for_post(
     claimed_paths: set[str] = set()
     sidecar: dict[str, Any] | None = None
     sidecar_claimed = False
+    legacy_fallback_allowed = state.has_post_file_in_directory(post_id, output_dir) or (
+        legacy_directory_has_candidate_artifact(output_dir, candidates)
+    )
+    if (
+        not post_sidecar_path(output_dir).exists()
+        and output_dir.is_dir()
+        and any(output_dir.iterdir())
+        and not legacy_fallback_allowed
+    ):
+        collision_dir = collision_post_output_dir(output_dir, post_meta)
+        print(f"[path-collision] preserving unknown directory {output_dir}; using {collision_dir}")
+        output_dir = collision_dir
+        legacy_fallback_allowed = state.has_post_file_in_directory(post_id, output_dir) or (
+            legacy_directory_has_candidate_artifact(output_dir, candidates)
+        )
 
     for candidate in candidates:
         signature = candidate_name_signature(candidate)
@@ -884,7 +1029,7 @@ def download_candidates_for_post(
         if skip_existing and not overwrite and existing_entry:
             existing_path = str(existing_entry.get("path") or "")
             claimed_paths.add(file_claim_key(existing_path))
-            if matched_key != key:
+            if matched_key != key and not dry_run:
                 state.alias(key, existing_entry, post_meta, candidate, matched_key)
                 state.save()
             record = {
@@ -901,7 +1046,12 @@ def download_candidates_for_post(
 
         if not sidecar_claimed:
             try:
-                sidecar = claim_post_directory(output_dir, post_meta, dry_run=dry_run)
+                sidecar = claim_post_directory(
+                    output_dir,
+                    post_meta,
+                    dry_run=dry_run,
+                    allow_nonempty_without_sidecar=legacy_fallback_allowed,
+                )
             except Exception as exc:
                 records.append({"status": "failed", "key": key, **post_meta, "error": str(exc)})
                 return records
@@ -910,7 +1060,14 @@ def download_candidates_for_post(
         existing_path = (
             None
             if overwrite or not skip_existing
-            else existing_candidate_file(output_dir, candidate, duplicate_index, key, sidecar)
+            else existing_candidate_file(
+                output_dir,
+                candidate,
+                duplicate_index,
+                key,
+                sidecar,
+                allow_legacy_fallback=legacy_fallback_allowed,
+            )
         )
         if existing_path and file_claim_key(existing_path) in claimed_paths:
             existing_path = None
@@ -927,14 +1084,16 @@ def download_candidates_for_post(
                 "bytes": existing_path.stat().st_size,
                 **post_meta,
             }
-            record_sidecar_asset(output_dir, sidecar, key, candidate, record)
-            state.mark(key, record)
-            state.save()
+            if not dry_run:
+                record_sidecar_asset(output_dir, sidecar, key, candidate, record)
+                state.mark(key, record)
+                state.save()
             print(f"[skip-file] {existing_path}")
             records.append(record)
             continue
 
-        output_dir.mkdir(parents=True, exist_ok=True)
+        if not dry_run:
+            output_dir.mkdir(parents=True, exist_ok=True)
         record = download_candidate(
             session=session,
             candidate=candidate,
@@ -976,6 +1135,48 @@ def post_output_dir(
         / creator_directory_name(creator_name, creator_id)
         / post_directory_name(publish_time, title, post_id)
     )
+
+
+def collision_post_output_dir(preferred_dir: Path, post_meta: dict[str, Any]) -> Path:
+    return preferred_dir.with_name(
+        collision_directory_name(
+            preferred_dir.name,
+            str(post_meta.get("post_id") or ""),
+        )
+    )
+
+
+def resolve_post_output_dir(preferred_dir: Path, post_meta: dict[str, Any]) -> Path:
+    sidecar = load_post_sidecar(preferred_dir)
+    if sidecar is None:
+        return preferred_dir
+
+    path = post_sidecar_path(preferred_dir)
+    creator = sidecar.get("creator")
+    post = sidecar.get("post")
+    if (
+        sidecar.get("schema_version") != POST_SIDECAR_SCHEMA_VERSION
+        or not isinstance(creator, dict)
+        or not isinstance(post, dict)
+        or not isinstance(sidecar.get("assets"), dict)
+    ):
+        validate_post_sidecar(sidecar, post_meta, path)
+
+    expected_post_id = str(post_meta.get("post_id") or "")
+    expected_creator_id = str(post_meta.get("creator_id") or "")
+    actual_post_id = str(post.get("id") or "")
+    actual_creator_id = str(creator.get("id") or "")
+    if actual_post_id == expected_post_id and (
+        not expected_creator_id or actual_creator_id == expected_creator_id
+    ):
+        validate_post_sidecar(sidecar, post_meta, path)
+        return preferred_dir
+
+    collision_dir = collision_post_output_dir(preferred_dir, post_meta)
+    collision_sidecar = load_post_sidecar(collision_dir)
+    if collision_sidecar is not None:
+        validate_post_sidecar(collision_sidecar, post_meta, post_sidecar_path(collision_dir))
+    return collision_dir
 
 
 def run_creator(config: dict[str, Any], config_dir: Path, creator_config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1145,13 +1346,16 @@ def run_creator(config: dict[str, Any], config_dir: Path, creator_config: dict[s
                 print(f"[access-restored] {title}: no downloadable files; retry state cleared")
             continue
 
-        post_dir = post_output_dir(
-            download_dir,
-            creator_name,
-            post.publish_time,
-            str(post_meta["post_title"]),
-            post.post_id,
-            creator_id=creator_id,
+        post_dir = resolve_post_output_dir(
+            post_output_dir(
+                download_dir,
+                creator_name,
+                post.publish_time,
+                str(post_meta["post_title"]),
+                post.post_id,
+                creator_id=creator_id,
+            ),
+            post_meta,
         )
         post_records = download_candidates_for_post(session, candidates, post_dir, state, effective, post_meta)
         downloaded += sum(1 for record in post_records if record.get("status") == "downloaded")
@@ -1260,13 +1464,16 @@ def run_single_post(config: dict[str, Any], config_dir: Path, post_url: str) -> 
     if not candidates:
         records = [{"status": "no-files", **post_meta}]
     else:
-        post_dir = post_output_dir(
-            download_dir,
-            creator_name,
-            int(detail.get("publish_time") or 0),
-            title,
-            post_id,
-            creator_id=creator_id,
+        post_dir = resolve_post_output_dir(
+            post_output_dir(
+                download_dir,
+                creator_name,
+                int(detail.get("publish_time") or 0),
+                title,
+                post_id,
+                creator_id=creator_id,
+            ),
+            post_meta,
         )
         records = download_candidates_for_post(session, candidates, post_dir, state, config, post_meta)
 

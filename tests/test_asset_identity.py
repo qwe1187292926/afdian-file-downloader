@@ -12,49 +12,23 @@ from afdian_config_common import (
 from afdian_downloader import Candidate, dedupe_candidates, filename_from_url
 
 
-class StableOutputPathTests(unittest.TestCase):
-    def test_creator_and_post_ids_make_paths_collision_proof_and_rename_stable(self) -> None:
+class ReadableOutputPathTests(unittest.TestCase):
+    def test_preferred_path_keeps_the_pre_ffed164_readable_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            first = post_output_dir(
+            output_dir = post_output_dir(
                 root,
-                "Same Creator",
-                1_721_000_000,
-                "Same Title",
-                "post-A",
-                creator_id="creator-A",
-            )
-            renamed = post_output_dir(
-                root,
-                "Renamed Creator",
-                1_721_000_000,
-                "Renamed Title",
-                "post-A",
-                creator_id="creator-A",
-            )
-            second = post_output_dir(
-                root,
-                "Same Creator",
-                1_721_000_000,
-                "Same Title",
-                "post-B",
-                creator_id="creator-A",
-            )
-            other_creator = post_output_dir(
-                root,
-                "Same Creator",
-                1_721_000_000,
-                "Same Title",
-                "post-A",
-                creator_id="creator-B",
+                "辣不辣Hyo",
+                1_752_787_200,
+                "KU100 1v1轻语助眠天鹅",
+                "85f0bbb0821111f1a73852540025c377",
+                creator_id="ff8b0492c95811ecb44252540025c377",
             )
 
-            self.assertEqual(first, renamed)
-            self.assertNotEqual(first, second)
-            self.assertNotEqual(first, other_creator)
-            self.assertIn("creator-A", str(first.relative_to(root)))
-            self.assertIn("post-A", str(first.relative_to(root)))
-            self.assertIn("post-B", str(second.relative_to(root)))
+            self.assertEqual(
+                root / "辣不辣Hyo" / "2025-07-18-KU100-1v1轻语助眠天鹅",
+                output_dir,
+            )
 
 
 class CandidateIdentityTests(unittest.TestCase):

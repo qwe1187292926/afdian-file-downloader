@@ -238,7 +238,7 @@ class LegacyStateMigrationTests(unittest.TestCase):
             self.assertEqual("already-downloaded", records[0]["status"])
             self.assertEqual(old_file.resolve(), Path(records[0]["path"]).resolve())
 
-    def test_functional_query_change_is_not_migrated_from_query_blind_v1_state(self) -> None:
+    def test_exact_query_blind_v1_entry_is_reused_to_avoid_a_legacy_redownload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             state = DownloadState(root / "state.json")
@@ -264,6 +264,41 @@ class LegacyStateMigrationTests(unittest.TestCase):
                 asset_locator=old_candidate.asset_locator,
             )
 
+            with patch("afdian_config_common.download_candidate") as mocked_download:
+                records = download_candidates_for_post(
+                    session=None,
+                    candidates=[replacement],
+                    output_dir=root / "new-layout",
+                    state=state,
+                    config={"skip_existing": True},
+                    post_meta=post_meta(),
+                )
+
+            mocked_download.assert_not_called()
+            self.assertEqual("already-downloaded", records[0]["status"])
+            self.assertEqual(old_file.resolve(), Path(records[0]["path"]).resolve())
+            self.assertIn(download_key("post-1", replacement), state.data["downloads"])
+
+    def test_query_bearing_candidate_does_not_use_url_only_fuzzy_legacy_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state = DownloadState(root / "state.json")
+            old_file = root / "old.bin"
+            old_file.write_bytes(b"old")
+            state.data["downloads"]["unrelated-legacy-key"] = {
+                "path": str(old_file),
+                "bytes": 3,
+                "post_id": "post-1",
+                "post_title": "archive",
+                "url": "https://cdn.example/download",
+            }
+            candidate = Candidate(
+                url="https://cdn.example/download?id=new",
+                source="api:attachment[1].url",
+                filename_hint="archive",
+                asset_locator="api:attachment[1]",
+            )
+
             def fake_download_candidate(**kwargs):
                 target = kwargs["output_dir"] / "new.bin"
                 target.write_bytes(b"new")
@@ -280,7 +315,7 @@ class LegacyStateMigrationTests(unittest.TestCase):
             ) as mocked_download:
                 records = download_candidates_for_post(
                     session=None,
-                    candidates=[replacement],
+                    candidates=[candidate],
                     output_dir=root / "new-layout",
                     state=state,
                     config={"skip_existing": True},
@@ -351,6 +386,63 @@ class LegacyStateMigrationTests(unittest.TestCase):
             )
             resolved_paths = [Path(record["path"]).resolve() for record in records]
             self.assertEqual(1, resolved_paths.count(shared_file.resolve()))
+
+    def test_live_v2_owner_prevents_another_post_from_claiming_the_same_legacy_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state = DownloadState(root / "state.json")
+            shared_file = root / "shared.bin"
+            shared_file.write_bytes(b"old")
+            candidate = Candidate(
+                url="https://cdn.example/shared.bin",
+                source="api:attachment[1].url",
+                filename_hint="shared",
+                asset_locator="api:attachment[1]",
+            )
+            legacy_key = download_key_v1("post-1", candidate)
+            state.data["downloads"][legacy_key] = {
+                "path": str(shared_file),
+                "bytes": 3,
+                "post_id": "post-1",
+                "post_title": "Post",
+                "url": candidate.url,
+            }
+            state.data["downloads"]["v2:existing-owner"] = {
+                "path": str(shared_file),
+                "bytes": 3,
+                "post_id": "different-post",
+                "post_title": "Different",
+                "identity_version": 2,
+                "asset_key": "v2:existing-owner",
+                "asset_locator": "api:attachment[1]",
+            }
+
+            def fake_download_candidate(**kwargs):
+                target = kwargs["output_dir"] / "new.bin"
+                target.write_bytes(b"new")
+                return {
+                    "status": "downloaded",
+                    "url": kwargs["candidate"].url,
+                    "path": str(target),
+                    "bytes": 3,
+                }
+
+            with patch(
+                "afdian_config_common.download_candidate",
+                side_effect=fake_download_candidate,
+            ) as mocked_download:
+                records = download_candidates_for_post(
+                    session=None,
+                    candidates=[candidate],
+                    output_dir=root / "post-1-output",
+                    state=state,
+                    config={"skip_existing": True},
+                    post_meta=post_meta(),
+                )
+
+            mocked_download.assert_called_once()
+            self.assertEqual("downloaded", records[0]["status"])
+            self.assertNotEqual(shared_file.resolve(), Path(records[0]["path"]).resolve())
 
     def test_ambiguous_v1_entry_is_not_claimed_by_two_functional_query_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

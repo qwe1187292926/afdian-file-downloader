@@ -176,8 +176,8 @@ def slug_from_text(text: str, fallback: str) -> str:
 def stable_id_component(value: str, fallback: str) -> str:
     raw = str(value or "").strip()
     identity = raw or fallback
-    prefix = slug_from_text(identity, fallback=fallback)[:24]
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    prefix = slug_from_text(identity, fallback=fallback)[:12]
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
     return f"{prefix}-{digest}"
 
 
@@ -237,15 +237,32 @@ def format_publish_date(timestamp: int) -> str:
 
 
 def creator_directory_name(creator_name: str, creator_id: str) -> str:
-    del creator_name
-    identity = stable_id_component(creator_id, fallback="unknown-creator")
-    return f"creator-{identity}"
+    del creator_id
+    return sanitize_filename(creator_name, fallback="creator")
 
 
 def post_directory_name(publish_time: int, title: str, post_id: str) -> str:
-    del publish_time, title
-    identity = stable_id_component(post_id, fallback="unknown-post")
-    return f"post-{identity}"
+    return slug_from_text(
+        f"{format_publish_date(publish_time)} {title}",
+        fallback=post_id[:12] or "post",
+    )
+
+
+def truncate_utf8_component(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip(" .-")
+
+
+def collision_directory_name(readable_name: str, post_id: str) -> str:
+    identity = stable_id_component(post_id, fallback="post")
+    suffix = f"--{identity}"
+    readable_name = truncate_utf8_component(
+        readable_name,
+        max_bytes=240 - len(suffix.encode("utf-8")),
+    )
+    return f"{readable_name}{suffix}"
 
 
 def signed_query_keys_to_remove(query_items: list[tuple[str, str]]) -> set[str]:
