@@ -142,6 +142,40 @@ def file_claim_key(path: str | Path) -> str:
     return os.path.normcase(str(resolved))
 
 
+def stored_asset_identity_url(entry: dict[str, Any]) -> str:
+    return str(entry.get("identity_url") or entry.get("url") or "")
+
+
+def v2_entry_matches_candidate(
+    entry: dict[str, Any],
+    post_id: str,
+    candidate: Candidate,
+) -> bool:
+    asset_locator = candidate.asset_locator.strip()
+    stored_url = stored_asset_identity_url(entry)
+    return bool(
+        entry.get("identity_version") == ASSET_IDENTITY_VERSION
+        and asset_locator
+        and str(entry.get("post_id") or "") == post_id
+        and str(entry.get("asset_locator") or "") == asset_locator
+        and stored_url
+        and canonical_download_url(stored_url) == canonical_download_url(candidate.url)
+    )
+
+
+def existing_path_preference(
+    path: str | Path,
+    preferred_paths: list[Path],
+) -> tuple[int, int, int, str, str]:
+    path_obj = Path(path)
+    path_key = file_claim_key(path_obj)
+    preferred = {file_claim_key(item): index for index, item in enumerate(preferred_paths)}
+    preferred_index = preferred.get(path_key)
+    if preferred_index is not None:
+        return (0, preferred_index, len(path_obj.name), path_obj.name.casefold(), path_key)
+    return (1, len(preferred), len(path_obj.name), path_obj.name.casefold(), path_key)
+
+
 class DownloadState:
     def __init__(self, path: Path):
         self.path = path
@@ -198,6 +232,7 @@ class DownloadState:
         asset_key: str,
         post_id: str,
         asset_locator: str,
+        identity_url: str = "",
     ) -> bool:
         target_path = file_claim_key(path)
         for existing_key, entry in self.data.get("downloads", {}).items():
@@ -217,9 +252,74 @@ class DownloadState:
                 and str(entry.get("post_id") or "") == post_id
                 and str(entry.get("asset_locator") or "") == asset_locator
             )
+            if same_logical_asset and identity_url:
+                stored_url = stored_asset_identity_url(entry)
+                same_logical_asset = bool(
+                    stored_url
+                    and canonical_download_url(stored_url) == identity_url
+                )
             if not same_logical_asset:
                 return True
         return False
+
+    def find_compatible_v2_entry(
+        self,
+        post_id: str,
+        candidate: Candidate,
+        asset_key: str,
+        claimed_paths: set[str],
+        preferred_paths: list[Path],
+    ) -> tuple[str, dict[str, Any]] | None:
+        target_url = canonical_download_url(candidate.url)
+        matches: list[tuple[str, dict[str, Any]]] = []
+        for existing_key, entry in self.data.get("downloads", {}).items():
+            if (
+                not isinstance(entry, dict)
+                or str(existing_key) == asset_key
+                or not v2_entry_matches_candidate(entry, post_id, candidate)
+            ):
+                continue
+            path = str(entry.get("path") or "")
+            if (
+                not path
+                or file_claim_key(path) in claimed_paths
+                or not Path(path).is_file()
+                or self.path_claimed_by_other_v2_asset(
+                    path,
+                    asset_key,
+                    post_id,
+                    candidate.asset_locator,
+                    target_url,
+                )
+            ):
+                continue
+            matches.append((str(existing_key), entry))
+
+        if not matches:
+            return None
+
+        preferred_existing = {
+            file_claim_key(path)
+            for path in preferred_paths
+            if path.is_file()
+        }
+        preferred_matches = [
+            item
+            for item in matches
+            if file_claim_key(str(item[1].get("path") or "")) in preferred_existing
+        ]
+        if preferred_matches:
+            matches = preferred_matches
+        elif preferred_existing:
+            return None
+
+        return min(
+            matches,
+            key=lambda item: existing_path_preference(
+                str(item[1].get("path") or ""),
+                preferred_paths,
+            ),
+        )
 
     def alias(
         self,
@@ -235,6 +335,7 @@ class DownloadState:
         entry["identity_version"] = ASSET_IDENTITY_VERSION
         entry["asset_key"] = new_key
         entry["identity_url"] = canonical_download_url(candidate.url)
+        entry["url"] = canonical_download_url(candidate.url)
         entry["asset_locator"] = candidate.asset_locator
         entry["migrated_from"] = migrated_from
         entry["migrated_at"] = now_iso()
@@ -277,6 +378,7 @@ class DownloadState:
                 download_key(post_id, candidate),
                 post_id,
                 candidate.asset_locator,
+                canonical_download_url(candidate.url),
             ):
                 continue
             matches.append((str(existing_key), entry))
@@ -733,15 +835,34 @@ def safe_sidecar_asset_path(output_dir: Path, sidecar: dict[str, Any], asset_key
     return target
 
 
+def sidecar_entry_matches_candidate(entry: dict[str, Any], candidate: Candidate) -> bool:
+    asset_locator = candidate.asset_locator.strip()
+    identity_url = str(entry.get("identity_url") or "")
+    return bool(
+        asset_locator
+        and str(entry.get("asset_locator") or "") == asset_locator
+        and identity_url
+        and canonical_download_url(identity_url) == canonical_download_url(candidate.url)
+    )
+
+
 def sidecar_path_is_claimed_by_other_asset(
     output_dir: Path,
     sidecar: dict[str, Any],
     asset_key: str,
     target: Path,
+    candidate: Candidate | None = None,
 ) -> bool:
     target_key = file_claim_key(target)
     for other_key in sidecar.get("assets", {}):
         if other_key == asset_key:
+            continue
+        entry = sidecar.get("assets", {}).get(other_key)
+        if (
+            candidate is not None
+            and isinstance(entry, dict)
+            and sidecar_entry_matches_candidate(entry, candidate)
+        ):
             continue
         other_path = safe_sidecar_asset_path(output_dir, sidecar, str(other_key))
         if other_path and file_claim_key(other_path) == target_key:
@@ -867,7 +988,37 @@ def existing_candidate_file(
     elif not allow_legacy_fallback:
         return None
 
-    for exact in expected_candidate_paths(output_dir, candidate, duplicate_index):
+    expected_paths = expected_candidate_paths(output_dir, candidate, duplicate_index)
+    compatible_sidecar_paths: list[Path] = []
+    if sidecar is not None and candidate.asset_locator.strip():
+        for other_key, entry in sidecar.get("assets", {}).items():
+            if other_key == asset_key or not isinstance(entry, dict):
+                continue
+            if not sidecar_entry_matches_candidate(entry, candidate):
+                continue
+            path = safe_sidecar_asset_path(output_dir, sidecar, str(other_key))
+            if path and not sidecar_path_is_claimed_by_other_asset(
+                output_dir,
+                sidecar,
+                asset_key,
+                path,
+                candidate,
+            ):
+                compatible_sidecar_paths.append(path)
+
+    expected_keys = {file_claim_key(path) for path in expected_paths}
+    preferred_sidecar_paths = [
+        path
+        for path in compatible_sidecar_paths
+        if file_claim_key(path) in expected_keys
+    ]
+    if preferred_sidecar_paths:
+        return min(
+            preferred_sidecar_paths,
+            key=lambda path: existing_path_preference(path, expected_paths),
+        )
+
+    for exact in expected_paths:
         if not is_safe_direct_child_file(output_dir, exact):
             continue
         if sidecar is not None and sidecar_path_is_claimed_by_other_asset(
@@ -875,9 +1026,15 @@ def existing_candidate_file(
             sidecar,
             asset_key,
             exact,
+            candidate,
         ):
             continue
         return exact
+    if compatible_sidecar_paths:
+        return min(
+            compatible_sidecar_paths,
+            key=lambda path: existing_path_preference(path, expected_paths),
+        )
     return None
 
 
@@ -921,12 +1078,23 @@ def compatible_state_entry(
     v0_counts: Counter[str],
     legacy_url_counts: Counter[str],
     claimed_paths: set[str],
+    preferred_paths: list[Path],
 ) -> tuple[str, dict[str, Any]] | None:
     exact = state.get_existing_entry(key)
     if exact:
         path = str(exact.get("path") or "")
         if path and file_claim_key(path) not in claimed_paths:
             return key, exact
+
+    compatible_v2 = state.find_compatible_v2_entry(
+        post_id,
+        candidate,
+        key,
+        claimed_paths,
+        preferred_paths,
+    )
+    if compatible_v2:
+        return compatible_v2
 
     v1_key = download_key_v1(post_id, candidate)
     if v1_counts[v1_key] == 1:
@@ -941,6 +1109,7 @@ def compatible_state_entry(
                 key,
                 post_id,
                 candidate.asset_locator,
+                canonical_download_url(candidate.url),
             )
         ):
             return v1_key, entry
@@ -958,6 +1127,7 @@ def compatible_state_entry(
                 key,
                 post_id,
                 candidate.asset_locator,
+                canonical_download_url(candidate.url),
             )
         ):
             return v0_key, entry
@@ -1024,6 +1194,7 @@ def download_candidates_for_post(
             v0_counts,
             legacy_url_counts,
             claimed_paths,
+            expected_candidate_paths(output_dir, candidate, duplicate_index),
         )
         matched_key, existing_entry = compatible if compatible else ("", None)
         if skip_existing and not overwrite and existing_entry:
@@ -1070,6 +1241,14 @@ def download_candidates_for_post(
             )
         )
         if existing_path and file_claim_key(existing_path) in claimed_paths:
+            existing_path = None
+        if existing_path and state.path_claimed_by_other_v2_asset(
+            str(existing_path),
+            key,
+            post_id,
+            candidate.asset_locator,
+            canonical_download_url(candidate.url),
+        ):
             existing_path = None
         if existing_path:
             claimed_paths.add(file_claim_key(existing_path))

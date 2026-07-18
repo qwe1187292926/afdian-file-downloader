@@ -83,6 +83,69 @@ class CandidateIdentityTests(unittest.TestCase):
         with self.subTest("candidate dedupe"):
             self.assertEqual(2, len(dedupe_candidates([first, refreshed])))
 
+    def test_ifdian_vod_signature_rotation_is_ignored_only_for_the_complete_family(self) -> None:
+        first = Candidate(
+            url="https://vod.afdiancdn.com/video/asset.mp4?sign=old&t=100&us=user-a",
+            source="api:video",
+            filename_hint="Video",
+            asset_locator="api:video",
+        )
+        refreshed = Candidate(
+            url="https://vod.afdiancdn.com/video/asset.mp4?sign=new&t=200&us=user-b",
+            source=first.source,
+            filename_hint=first.filename_hint,
+            asset_locator=first.asset_locator,
+        )
+        different_path = Candidate(
+            url="https://vod.afdiancdn.com/video/replacement.mp4?sign=new&t=200&us=user-b",
+            source=first.source,
+            filename_hint=first.filename_hint,
+            asset_locator=first.asset_locator,
+        )
+        different_quality = Candidate(
+            url=refreshed.url + "&quality=preview",
+            source=first.source,
+            filename_hint=first.filename_hint,
+            asset_locator=first.asset_locator,
+        )
+        incomplete_first = Candidate(
+            url="https://vod.afdiancdn.com/video/asset.mp4?sign=old&t=100",
+            source=first.source,
+            filename_hint=first.filename_hint,
+            asset_locator=first.asset_locator,
+        )
+        incomplete_refreshed = Candidate(
+            url="https://vod.afdiancdn.com/video/asset.mp4?sign=new&t=200",
+            source=first.source,
+            filename_hint=first.filename_hint,
+            asset_locator=first.asset_locator,
+        )
+        other_host_first = Candidate(
+            url="https://cdn.example/video/asset.mp4?sign=old&t=100&us=user-a",
+            source=first.source,
+            filename_hint=first.filename_hint,
+            asset_locator=first.asset_locator,
+        )
+        other_host_refreshed = Candidate(
+            url="https://cdn.example/video/asset.mp4?sign=new&t=200&us=user-b",
+            source=first.source,
+            filename_hint=first.filename_hint,
+            asset_locator=first.asset_locator,
+        )
+
+        self.assertEqual(download_key("post-1", first), download_key("post-1", refreshed))
+        self.assertEqual(1, len(dedupe_candidates([first, refreshed])))
+        self.assertNotEqual(download_key("post-1", first), download_key("post-1", different_path))
+        self.assertNotEqual(download_key("post-1", first), download_key("post-1", different_quality))
+        self.assertNotEqual(
+            download_key("post-1", incomplete_first),
+            download_key("post-1", incomplete_refreshed),
+        )
+        self.assertNotEqual(
+            download_key("post-1", other_host_first),
+            download_key("post-1", other_host_refreshed),
+        )
+
     def test_complete_amz_signature_family_is_ignored_but_functional_query_is_kept(self) -> None:
         first = Candidate(
             url=(

@@ -31,6 +31,8 @@ except ModuleNotFoundError:
 
 
 AFDIAN_HOME = "https://ifdian.net/"
+IFDIAN_VOD_HOST = "vod.afdiancdn.com"
+IFDIAN_VOD_AUTH_QUERY_KEYS = frozenset({"sign", "t", "us"})
 AFDIAN_LOGIN_URLS = (
     "https://ifdian.net/",
     "https://afdian.com/",
@@ -324,6 +326,12 @@ def canonical_candidate_url(url: str) -> str:
     parsed = urlparse(url)
     query_items = parse_qsl(parsed.query, keep_blank_values=True)
     removable_keys = signed_query_keys_to_remove(query_items)
+    query_keys = {key.lower() for key, _value in query_items}
+    if (
+        (parsed.hostname or "").lower() == IFDIAN_VOD_HOST
+        and IFDIAN_VOD_AUTH_QUERY_KEYS <= query_keys
+    ):
+        removable_keys.update(IFDIAN_VOD_AUTH_QUERY_KEYS)
     stable_query = [
         (key, value)
         for key, value in query_items
